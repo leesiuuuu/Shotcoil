@@ -1,0 +1,4824 @@
+﻿/*******************************************************************************
+*   SHOTCOIL - Recoil Shooter
+*
+*   There is no move button. You shoot, and the recoil throws you.
+*   Aiming IS movement.
+*
+*   Single translation unit, zero asset files (shapes + synthesized audio only)
+*   so the whole game stays far under the 1.44MB contest budget.
+*******************************************************************************/
+
+#include "raylib.h"
+#include "raymath.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*----------------------------------------------------------------------------*/
+/* Configuration                                                              */
+/*                                                                            */
+/* The whole game is authored in a fixed 1280x720 (16:9) virtual space. Every  */
+/* position, radius and font size below is in those units. At draw time the    */
+/* virtual space is scaled to fill the real window and letterboxed, so the     */
+/* layout is pixel-identical on a 16:10 laptop panel and a 16:9 monitor alike. */
+/*----------------------------------------------------------------------------*/
+#define SCREEN_W        1280
+#define SCREEN_H        720
+#define GROUND_Y        (SCREEN_H - 56)
+
+#define MAX_BULLETS     256
+#define MAX_ENEMIES     96
+#define MAX_PARTICLES   1200
+#define MAX_POPUPS      32
+#define MAX_SPAWNQUEUE  64
+
+#define PLAYER_RADIUS   16.0f
+#define PLAYER_MAX_HP   5
+
+/* Floor heat. The band is how high above the floor still counts as "down
+   there"; skimming inside it bakes at SKIM_RATE, and heat only drains once you
+   are above it - slower than it fills, so a quick hop never wipes the gauge. */
+#define GROUND_HEAT_BAND  60.0f
+#define GROUND_SKIM_RATE  0.60f
+#define GROUND_COOL_RATE  0.75f
+
+/* The waves never stop. There is no clear condition - a run ends when you do,
+   and the only score that matters is how deep you got. */
+
+#define SAVE_FILE       "shotcoil.sav"
+
+/*----------------------------------------------------------------------------*/
+/* Tunables - the five (six) numbers that decide whether the game feels good.  */
+/* Editable live from the in-game panel (F1).                                  */
+/*----------------------------------------------------------------------------*/
+typedef struct Tunables {
+    float recoilImpulse;    /* how hard one shot throws you            */
+    float gravity;          /* how fast you fall                       */
+    float airDrag;          /* per-60th-of-a-second velocity retention  */
+    float fireCooldown;     /* seconds between shots - the flight throttle */
+    float groundTime;       /* floor-heat capacity: seconds of standing to erupt */
+    float mouseSens;        /* only used while the cursor is locked - see below */
+} Tunables;
+
+static const Tunables TUNE_DEFAULT = {
+    460.0f,     /* recoilImpulse */
+    900.0f,     /* gravity       */
+    0.990f,     /* airDrag       */
+    0.32f,      /* fireCooldown  */
+    1.2f,       /* groundTime    */
+    2.0f        /* mouseSens     */
+};
+
+#define PARAM_COUNT 6
+
+static Tunables tune;
+
+typedef struct ParamRow {
+    const char *name;
+    float      *value;
+    float       step;
+    float       min;
+    float       max;
+    int         decimals;
+} ParamRow;
+
+static ParamRow params[PARAM_COUNT];
+static int  paramSel     = 0;
+static bool panelVisible = false;
+
+/*----------------------------------------------------------------------------*/
+/* Weapons                                                                    */
+/*                                                                            */
+/* A weapon is an engine as much as a gun: the recoil multiplier is your       */
+/* thrust per shot and the fire interval is your throttle. Picked up weapons   */
+/* are kept until you die.                                                     */
+/*----------------------------------------------------------------------------*/
+typedef enum WeaponType {
+    WP_PISTOL, WP_SMG, WP_SWORD, WP_SHOTGUN, WP_RAILGUN, WP_GRENADE, WP_BAZOOKA,
+    WP_FLAMER, WP_RICOCHET, WP_HARPOON, WP_LASER, WP_COUNT
+} WeaponType;
+
+typedef struct WeaponDef {
+    const char *name;
+    float recoilMul;     /* thrust per shot, relative to RECOIL_IMPULSE  */
+    float cooldownMul;   /* fire interval, relative to FIRE_COOLDOWN     */
+    int   pellets;
+    float spread;        /* radians, half-angle */
+    float bulletSpeed;
+    float bulletRadius;
+    float damage;
+    float life;          /* seconds the shot lives - doubles as a grenade fuse */
+    float bulletGravity; /* grenades arc; everything else flies straight */
+    int   bounces;
+    int   pierce;        /* enemies a shot passes through before it dies */
+    bool  explosive;
+    bool  hitscan;       /* railgun: an instant piercing beam, no projectile */
+    bool  slash;         /* sword: a wide, very short-lived crescent */
+    float gunLen, gunThick;
+    Color color;
+} WeaponDef;
+
+/* With infinite ammo the fire interval is the ONLY thing rationing flight, so
+   every weapon is tuned to the same sustained thrust band: recoilMul divided by
+   cooldownMul stays inside 1.04-1.12 on everything except the SWORD, which is
+   deliberately higher. What differs is the texture - a 0.12s tap-hover on the
+   SMG versus a 0.86s cannon shove on the BAZOOKA. Nobody is strictly better;
+   they just fly differently, so keep that ratio when adding a weapon.        */
+static const WeaponDef WEAPONS[WP_COUNT] = {
+    /* Damage is set against enemy HP (chaser 2, dasher 4, splitter 4/2): the
+       starting PISTOL one-shots the basic chaser, and nothing takes more than
+       two hits from its natural counter. Bullets are drawn at their collision
+       radius, so a bigger number is both easier to land and easier to read.  */
+    /* name        recoil cool   pel spread  speed    rad   dmg  life  grav bnc prc boom hit slash len thick */
+    { "권총",       0.92f, 0.86f, 1, 0.025f, 980.0f,  6.5f, 2.0f, 1.40f,   0.0f, 1, 0, false,false,false, 26.0f,10.0f,
+      { 120, 240, 255, 255 } },
+    { "기관단총",   0.40f, 0.36f, 1, 0.070f, 1020.0f, 4.5f, 1.0f, 1.40f,   0.0f, 0, 0, false,false,false, 30.0f, 8.0f,
+      { 150, 255, 190, 255 } },
+    /* The mobility weapon: full recoil at the shortest interval, so its thrust
+       sits well above the others on purpose. The price is reach - the crescent
+       dies after ~150px, so flying on it means diving into contact range.    */
+    { "검",         1.00f, 0.72f, 1, 0.030f, 900.0f, 20.0f, 4.0f, 0.17f,   0.0f, 0, 0, false,false,true,  30.0f,13.0f,
+      { 255, 250, 210, 255 } },
+    { "산탄총",     1.85f, 1.65f, 5, 0.300f, 860.0f,  5.5f, 1.6f, 1.40f,   0.0f, 0, 0, false,false,false, 22.0f,15.0f,
+      { 255, 205,  90, 255 } },
+    { "레일건",     1.55f, 1.45f, 1, 0.000f,   0.0f,  0.0f, 5.0f, 0.00f,   0.0f, 0, 0, false,true, false, 36.0f,11.0f,
+      { 210, 140, 255, 255 } },
+    { "수류탄",     1.30f, 1.25f, 1, 0.040f, 620.0f,  8.0f, 4.0f, 1.30f, 900.0f, 3, 0, true, false,false, 24.0f,14.0f,
+      { 170, 255, 120, 255 } },
+    { "바주카포",   2.80f, 2.70f, 1, 0.010f, 520.0f, 10.0f, 5.0f, 2.50f,   0.0f, 0, 0, true, false,false, 32.0f,17.0f,
+      { 255, 110, 200, 255 } },
+    /* A cone that dies at ~120px. Enormous close-range output, and the tightest
+       hover in the game - but you have to be in the crowd to use either.     */
+    { "화염방사기", 0.55f, 0.50f, 5, 0.400f, 440.0f,  8.0f, 0.9f, 0.28f,   0.0f, 0, 1, false,false,false, 28.0f,12.0f,
+      { 255, 150,  60, 255 } },
+    /* Five wall bounces on a long fuse: the arena itself becomes the weapon,
+       and shots you already forgot about keep working behind you.            */
+    { "튕김총",     0.85f, 0.80f, 1, 0.050f, 900.0f,  5.5f, 2.0f, 2.60f,   0.0f, 5, 0, false,false,false, 27.0f, 9.0f,
+      { 120, 255, 230, 255 } },
+    /* One heavy spike, straight through a whole line of them.                */
+    { "작살포",     1.20f, 1.14f, 1, 0.012f, 1350.0f, 7.0f, 3.5f, 1.40f,   0.0f, 0, 4, false,false,false, 38.0f,10.0f,
+      { 255, 235, 140, 255 } },
+    /* The railgun's little sibling: same instant pierce, a third of the punch,
+       three times as often. Hitscan means range is never the problem.        */
+    { "레이저",     0.50f, 0.47f, 1, 0.000f,   0.0f,  0.0f, 1.6f, 0.00f,   0.0f, 0, 0, false,true, false, 34.0f, 8.0f,
+      { 140, 255, 255, 255 } }
+};
+
+#define SWORD_SWING    0.16f
+#define BLAST_RADIUS   115.0f
+#define BEAM_RADIUS    11.0f
+#define BEAM_RANGE     2200.0f
+
+/*----------------------------------------------------------------------------*/
+/* Entities                                                                   */
+/*----------------------------------------------------------------------------*/
+typedef enum GameState { ST_TITLE, ST_PLAY, ST_UPGRADE, ST_GAMEOVER } GameState;
+
+typedef enum EnemyType {
+    EN_CHASER, EN_DASHER, EN_RUSHER, EN_SPLITTER, EN_TURRET,
+    EN_BOMBER, EN_BOMBARDIER, EN_SHIELDER, EN_BOSS
+} EnemyType;
+
+/* Bosses rotate through these, one per boss wave, so wave 20 is not simply
+   wave 5 with more health. The kind is stashed in Enemy.tier. */
+/* Seven laps before a boss ever repeats. The back three are the big versions
+   of the three late enemies, and they sit at waves 25/30/35 - after the wave
+   the enemy itself arrives, so the boss is always the thing you already know
+   turned up to full size. */
+typedef enum BossKind {
+    BK_BARRAGE, BK_SUMMONER, BK_CHARGER, BK_VORTEX,
+    BK_BULWARK, BK_LANCER, BK_MORTAR, BK_COUNT
+} BossKind;
+
+/* SHIELDER - the late-game answer to "every enemy dies to whatever you happen
+   to be pointing at". It carries a shield that eats any direct hit arriving
+   inside SHIELD_ARC of where the shield faces, and the shield tracks you - but
+   only at SHIELD_TURN radians a second, which is slower than you fly. So it is
+   not a health sponge, it is a positioning problem: get behind it. The recoil
+   is what makes that a real decision, because the shots that carry you around
+   it are the ones that cannot hit it.
+
+   Area damage ignores the shield entirely (see UpdateBullets) - a rocket, a
+   backblast or a death blast is the other answer, so an explosives build is not
+   locked out of the enemy that punishes aim. */
+#define SHIELD_ARC    1.15f     /* half-angle, ~66 degrees to each side */
+#define SHIELD_TURN   1.1f      /* rad/s - a 180 turn takes about 2.9s   */
+#define SHIELD_LUNGE  560.0f
+
+/* The shield is a health pool of its own, so "get behind it" is an option
+   rather than an order. Blocked hits are spent on the plate at full damage:
+   about seven pistol shots to strip it, against four to kill the body once it
+   is gone. Flying around is still the cheaper answer - breaking it is what you
+   do when the room will not let you, and the enemy speeds up once it is bare,
+   so the choice costs something either way. */
+#define SHIELD_HP     14.0f
+#define SHIELD_BROKEN_SPEED 175.0f
+#define SHIELD_SPEED  100.0f
+
+/* RUSHER - the dasher's bigger cousin, and deliberately the opposite kind of
+   threat. A dasher commits to a lane the moment it winds up, so it is dodged
+   once and then it is spent. A rusher KEEPS AIMING through its lock-on and
+   then throws three dashes with a fresh lock between each, so one sidestep is
+   not an answer - you have to keep moving, which is what this game is for. */
+#define RUSH_LOCK     0.85f     /* first lock-on: long enough to read       */
+#define RUSH_RELOCK   0.30f     /* between dashes: only just enough to dodge */
+#define RUSH_TIME     0.36f
+#define RUSH_SPEED    820.0f
+#define RUSH_DASHES   3
+
+/* BOMBARDIER - the first enemy that attacks a PLACE instead of a line. Turrets
+   punish standing in their lane; this one lobs an arc that lands where you are
+   now and detonates on a fuse, so hovering anywhere is what it punishes. The
+   arc is solved for a fixed flight time (see ThrowBomb), which makes it read as
+   a lob you can outrun rather than as a homing shot. */
+#define BOMB_FLIGHT   1.15f     /* seconds from hand to landing point */
+#define BOMB_GRAV     900.0f
+#define BOMB_RADIUS   76.0f
+
+/* How many times the summoner boss comes apart: two rounds of doubling, so
+   1 -> 2 -> 4, seven bodies over the whole fight. One split was over the moment
+   it broke; three went the other way and buried the arena. Two gives the fight
+   a middle - it breaks, you deal with the halves, then it breaks AGAIN - while
+   still ending before the quarters wear out their welcome. Each generation is
+   cut HARD rather than halved (see KillEnemy), so the swarm gets flimsier as
+   fast as it gets numerous. */
+#define SUMMONER_SPLITS 2
+
+/* Health and size a summoner fragment keeps from the body it broke off. 0.26
+   is what keeps seven bodies an escalation instead of a slog:
+   1 + 2x0.26 + 4x0.26^2 = about 1.8x the parent's health, which is what this
+   fight has cost at every split count. */
+#define SUMMONER_CHILD_HP 0.26f
+#define SUMMONER_CHILD_R  0.68f
+
+#define BOMBER_RADIUS 96.0f
+
+/* Health a boss gains per lap through the roster, compounding (see SpawnEnemy).
+   The single most sensitive number in the late game: 1.30 is a wall that still
+   falls, 1.5 is a wall. */
+#define BOSS_LAP_GROWTH 1.30f
+
+/* Dasher state machine timings */
+#define DASH_WINDUP   0.75f
+#define DASH_TIME     0.45f
+#define DASH_RECOVER  0.70f
+#define DASH_SPEED    820.0f
+
+typedef struct Player {
+    Vector2 pos, vel;
+    float   aim;            /* radians */
+    float   cooldown;
+    int     hp;
+    float   invuln;
+    bool    grounded;
+    float   airTime;
+    float   groundT;        /* how long we have been standing - the floor heats up */
+    int     combo;
+    float   comboFlash;
+    float   muzzle;         /* muzzle flash timer */
+    float   blinkTimer;     /* counts down; the eyes shut while it is negative */
+    float   swingT;         /* katana swing animation, counts down */
+    int     swingSide;      /* alternates so consecutive slashes mirror */
+    float   shieldFlash;    /* AEGIS: counts down after a hit was negated */
+    float   blastT;         /* BACKBLAST ring throttle - purely cosmetic      */
+    WeaponType weapon;      /* kept until death */
+    float   deathT;
+    bool    alive;
+} Player;
+
+typedef struct Bullet {
+    Vector2 pos, vel;
+    float   radius;
+    float   life, maxLife;
+    float   damage;
+    float   grav;
+    int     bounces;
+    int     pierce;         /* enemies left to pass through before dying */
+    int     lastHit;        /* enemy index already hit, so one pass = one hit */
+    bool    fromPlayer;
+    bool    explosive;
+    bool    slash;
+    bool    active;
+    Color   color;
+} Bullet;
+
+typedef struct Enemy {
+    EnemyType type;
+    Vector2   pos, vel;
+    Vector2   lockDir;      /* dasher: direction committed at wind-up */
+    float     radius;
+    float     hp, maxHp;
+    float     timer;        /* attack timer         */
+    float     timer2;       /* secondary behaviour  */
+    float     rot, rotSpeed;
+    float     hitFlash;
+    float     spawnT;       /* telegraph countdown; > 0 == not yet solid */
+    float     guardT;       /* shielder: glow left over from the last block */
+    float     shield, shieldMax;  /* shielder: the plate's own health pool  */
+    int       tier;         /* splitter generation, or BossKind on a boss */
+    int       gen;          /* summoner: splits done. rusher: dashes left  */
+    int       phase;        /* dasher: 0 approach 1 wind-up 2 dash 3 recover */
+    bool      active;
+} Enemy;
+
+/* Dropped items. Kept to a handful so each one reads as an objective worth
+   flying to rather than as clutter. */
+typedef enum PickupKind { PK_HEAL, PK_WEAPON } PickupKind;
+
+typedef struct Pickup {
+    PickupKind kind;
+    WeaponType weapon;      /* meaningful when kind == PK_WEAPON */
+    Vector2    pos;
+    float      bob;
+    float      life;
+    bool       active;
+} Pickup;
+
+typedef struct Particle {
+    Vector2 pos, vel;
+    float   life, maxLife;
+    float   size;
+    float   grav;
+    float   drag;
+    Color   color;
+} Particle;
+
+/* An expanding ring that shows exactly how far an area effect reached. Purely
+   visual - it is spawned with the same radius the damage loop used. */
+typedef struct Shock {
+    Vector2 pos;
+    float   radius;
+    float   life, maxLife;
+    Color   color;
+    bool    active;
+} Shock;
+
+/* Railgun trace: purely visual, the damage is applied the instant it fires.
+   `hw` is the half-width that shot actually damaged with, carried over so the
+   trace is drawn at the size it hit at rather than a fixed one - the size
+   upgrade is invisible otherwise. It is stored per beam, not read from the
+   upgrade at draw time, so a trace still on screen when the next upgrade lands
+   keeps showing the shot that fired it. */
+typedef struct Beam {
+    Vector2 a, b;
+    float   life;
+    Color   color;
+    float   hw;
+    bool    active;
+} Beam;
+
+typedef struct Popup {
+    Vector2     pos;
+    float       life;
+    int         value;
+    const char *label;      /* when set, shown instead of the number */
+    Color       color;
+    bool        active;
+} Popup;
+
+/*----------------------------------------------------------------------------*/
+/* Globals                                                                    */
+/*----------------------------------------------------------------------------*/
+static GameState state;
+
+static Player    player;
+static Bullet    bullets[MAX_BULLETS];
+static Enemy     enemies[MAX_ENEMIES];
+static Particle  particles[MAX_PARTICLES];
+static Popup     popups[MAX_POPUPS];
+#define MAX_BEAMS 8
+static Beam      beams[MAX_BEAMS];
+#define MAX_SHOCKS 16
+static Shock     shocks[MAX_SHOCKS];
+#define MAX_PICKUPS 3
+static Pickup    pickups[MAX_PICKUPS];
+static float     healSpawnT, weaponSpawnT;   /* > 0 == a drop is pending */
+static int       lastHealWave, lastWeaponWave;
+
+static int   wave;
+static int   spawnQueue[MAX_SPAWNQUEUE];
+static int   spawnCount, spawnIdx;
+static float spawnTimer;
+static float waveBannerT;
+static float intermission;
+static bool  waveCleared;       /* true during the pause after the last kill */
+
+static long  score;
+static long  bestScore;
+static bool  newRecord;
+static float runTime;
+
+static float shake;
+static float hitstop;
+static float flashWhite;
+static float gameOverT;
+
+/*----------------------------------------------------------------------------*/
+/* Small helpers                                                              */
+/*----------------------------------------------------------------------------*/
+static float RandF(float a, float b)
+{
+    return a + (b - a) * ((float)GetRandomValue(0, 10000) / 10000.0f);
+}
+
+static Vector2 FromAngle(float rad, float len)
+{
+    return (Vector2){ cosf(rad) * len, sinf(rad) * len };
+}
+
+/* Signed shortest way round from angle b to angle a, in (-PI, PI]. Everything
+   that compares two headings needs this - a raw subtraction reports 350 degrees
+   where the real answer is -10. */
+static float AngleDelta(float a, float b)
+{
+    float d = fmodf(a - b + PI, 2.0f * PI);
+    if (d < 0.0f) d += 2.0f * PI;
+    return d - PI;
+}
+
+/* Shortest distance from point p to segment a-b. */
+static float DistToSegment(Vector2 p, Vector2 a, Vector2 b)
+{
+    Vector2 ab = Vector2Subtract(b, a);
+    float   len2 = Vector2LengthSqr(ab);
+    if (len2 < 0.0001f) return Vector2Distance(p, a);
+
+    float t = Vector2DotProduct(Vector2Subtract(p, a), ab) / len2;
+    t = Clamp(t, 0.0f, 1.0f);
+    return Vector2Distance(p, Vector2Add(a, Vector2Scale(ab, t)));
+}
+
+static void AddShake(float amount)
+{
+    shake += amount;
+    if (shake > 26.0f) shake = 26.0f;
+}
+
+/*----------------------------------------------------------------------------*/
+/* Viewport - maps the 1280x720 virtual space onto the real window            */
+/*----------------------------------------------------------------------------*/
+static float   viewScale  = 1.0f;           /* real pixels per virtual unit  */
+static Vector2 viewOrigin = { 0.0f, 0.0f }; /* letterbox offset, real pixels */
+static bool    fullscreen = true;
+
+static void UpdateViewport(void)
+{
+    float sw = (float)GetScreenWidth();
+    float sh = (float)GetScreenHeight();
+    if (sw < 1.0f || sh < 1.0f) return;     /* minimized */
+
+    viewScale  = fminf(sw / SCREEN_W, sh / SCREEN_H);
+    viewOrigin = (Vector2){ (sw - SCREEN_W * viewScale) * 0.5f,
+                            (sh - SCREEN_H * viewScale) * 0.5f };
+}
+
+/* Camera that draws virtual units into the letterboxed area. */
+static Camera2D ViewCamera(Vector2 shakeOffset)
+{
+    Camera2D cam = { 0 };
+    cam.zoom     = viewScale;
+    cam.rotation = 0.0f;
+    cam.target   = (Vector2){ 0.0f, 0.0f };
+    cam.offset   = Vector2Add(viewOrigin, shakeOffset);
+    return cam;
+}
+
+/* The aiming reticle, in virtual units.
+ *
+ * Fullscreen locks the OS pointer to the window so it cannot wander onto a
+ * second monitor mid-fight. A locked pointer has no meaningful absolute
+ * position, so there we integrate its frame deltas into a reticle we own.
+ *
+ * That path needs MOUSE_SENS: raylib's DisableCursor() also switches GLFW into
+ * GLFW_RAW_MOUSE_MOTION, which bypasses the OS pointer-speed slider and
+ * acceleration entirely. Raw device counts are typically far slower than the
+ * accelerated desktop cursor, so the multiplier exists to hand that feel back.
+ *
+ * Windowed mode leaves the pointer free - there is no reason to trap it - and
+ * simply maps its absolute position, which keeps the OS mouse settings. */
+static Vector2 aimCursor    = { SCREEN_W / 2.0f, SCREEN_H / 2.0f };
+static bool    cursorLocked = false;
+
+static void ApplyCursorMode(void)
+{
+    if (fullscreen && !cursorLocked)
+    {
+        DisableCursor();
+        cursorLocked = true;
+    }
+    else if (!fullscreen && cursorLocked)
+    {
+        EnableCursor();     /* unlock... */
+        HideCursor();       /* ...but still hide it, we draw our own crosshair */
+        cursorLocked = false;
+    }
+}
+
+static void UpdateAimCursor(void)
+{
+    if (viewScale <= 0.0f) return;
+
+    if (cursorLocked)
+    {
+        Vector2 d = GetMouseDelta();
+
+        /* Regaining focus or re-locking can report one enormous jump; swallow
+           it rather than teleporting the reticle across the arena. */
+        if (fabsf(d.x) > 400.0f || fabsf(d.y) > 400.0f) d = (Vector2){ 0.0f, 0.0f };
+
+        aimCursor = Vector2Add(aimCursor,
+                               Vector2Scale(d, tune.mouseSens / viewScale));
+    }
+    else
+    {
+        Vector2 m = GetMousePosition();
+        aimCursor = (Vector2){ (m.x - viewOrigin.x) / viewScale,
+                               (m.y - viewOrigin.y) / viewScale };
+    }
+
+    aimCursor.x = Clamp(aimCursor.x, 0.0f, (float)SCREEN_W);
+    aimCursor.y = Clamp(aimCursor.y, 0.0f, (float)SCREEN_H);
+}
+
+static Vector2 VirtualMouse(void)
+{
+    return aimCursor;
+}
+
+/*----------------------------------------------------------------------------*/
+/* Text - Galmuri11, a Korean pixel font, embedded as a subset TTF            */
+/*                                                                            */
+/* Galmuri is drawn on a 100-unit grid inside a 1200-unit em, and raylib sizes */
+/* a font by ascent-descent - 1400 units here. One design pixel is therefore   */
+/* exactly one screen pixel at size 14, and stays exact at every multiple of   */
+/* 14. At anything else the glyph edges land mid-pixel and the stems come out  */
+/* uneven, which is the one way to make a pixel font look cheap.               */
+/*                                                                            */
+/* The arena is scaled to fill the window, so "a multiple of 14 virtual units" */
+/* is not enough - at a 1.5x letterbox scale that is 21 real pixels. Both      */
+/* helpers below therefore snap in REAL pixels and convert back, so the text   */
+/* sits on the screen grid whatever the window size is.                        */
+/*----------------------------------------------------------------------------*/
+#include "galmuri.h"
+
+#define FONT_GRID 14
+
+typedef enum FontWeight { FW_REG, FW_BOLD } FontWeight;
+
+static Font uiFont[2];
+
+static Font LoadGalmuri(const unsigned char *data, int size)
+{
+    Font f = { 0 };
+    f.baseSize     = FONT_GRID;
+    f.glyphPadding = 1;         /* one transparent pixel is all POINT sampling needs */
+
+    /* FONT_BITMAP is hard on/off pixels. Anti-aliasing has nothing to add to a
+       font that is already exact at this size - it would only grey the edges. */
+    f.glyphs = LoadFontData(data, size, FONT_GRID, GALMURI_CODEPOINTS,
+                            GALMURI_CODEPOINT_COUNT, FONT_BITMAP, &f.glyphCount);
+    if (f.glyphs == NULL) return GetFontDefault();
+
+    Image atlas = GenImageFontAtlas(f.glyphs, &f.recs, f.glyphCount,
+                                    f.baseSize, f.glyphPadding, 0);
+    f.texture = LoadTextureFromImage(atlas);
+    UnloadImage(atlas);
+    SetTextureFilter(f.texture, TEXTURE_FILTER_POINT);
+    return f;
+}
+
+static void LoadUIFonts(void)
+{
+    uiFont[FW_REG]  = LoadGalmuri(GALMURI_REGULAR, GALMURI_REGULAR_SIZE);
+    uiFont[FW_BOLD] = LoadGalmuri(GALMURI_BOLD,    GALMURI_BOLD_SIZE);
+}
+
+static void UnloadUIFonts(void)
+{
+    for (int i = 0; i < 2; i++)
+        if (uiFont[i].texture.id != GetFontDefault().texture.id) UnloadFont(uiFont[i]);
+}
+
+/* Nearest whole multiple of the pixel grid, expressed back in virtual units. */
+static float UISize(float want)
+{
+    if (viewScale <= 0.0f) return want;
+    float k = floorf(want * viewScale / FONT_GRID + 0.5f);
+    if (k < 1.0f) k = 1.0f;
+    return (FONT_GRID * k) / viewScale;
+}
+
+/* Virtual coordinate that maps onto a whole screen pixel. */
+static float UISnap(float v, float origin)
+{
+    if (viewScale <= 0.0f) return v;
+    return (floorf(origin + v * viewScale + 0.5f) - origin) / viewScale;
+}
+
+static Vector2 UIMeasure(FontWeight w, const char *txt, float size)
+{
+    return MeasureTextEx(uiFont[w], txt, UISize(size), 0.0f);
+}
+
+static float UIWidth(FontWeight w, const char *txt, float size)
+{
+    return UIMeasure(w, txt, size).x;
+}
+
+static void UIDraw(FontWeight w, const char *txt, float x, float y, float size, Color c)
+{
+    Vector2 p = { UISnap(x, viewOrigin.x), UISnap(y, viewOrigin.y) };
+    DrawTextEx(uiFont[w], txt, p, UISize(size), 0.0f, c);
+}
+
+/* Centred horizontally on cx. '\n' starts a new line, and each line is centred
+   on its own - raylib's own newline handling left-aligns every line against the
+   widest one, which on a centred card reads as a layout mistake. */
+static void UIDrawC(FontWeight w, const char *txt, float cx, float y, float size, Color c)
+{
+    if (strchr(txt, '\n') == NULL)      /* the common case: nothing to split */
+    {
+        UIDraw(w, txt, cx - UIWidth(w, txt, size) * 0.5f, y, size, c);
+        return;
+    }
+
+    int          count = 0;
+    const char **lines = TextSplit(txt, '\n', &count);
+    float        step  = UISize(size) * 1.25f;
+
+    for (int i = 0; i < count; i++)
+        UIDraw(w, lines[i], cx - UIWidth(w, lines[i], size) * 0.5f,
+               y + i * step, size, c);
+}
+
+/* Centred, and the size is taken literally instead of being snapped to the
+   pixel grid.
+
+   Only for text that ANIMATES its scale. A snapped size can only ever step
+   between whole multiples of the grid, which turns a smooth pop into a
+   stutter - so a growing-and-settling number has to give up the grid to move
+   smoothly. Pass a snapped size as the base (UISize(...) * pop) and the text
+   still lands exactly on the grid once the animation has come to rest.
+   Everything static should stay on UIDrawC. */
+static void UIDrawCFree(FontWeight w, const char *txt, float cx, float y,
+                        float size, Color c)
+{
+    float half = MeasureTextEx(uiFont[w], txt, size, 0.0f).x * 0.5f;
+    DrawTextEx(uiFont[w], txt, (Vector2){ cx - half, y }, size, 0.0f, c);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Roguelike upgrades                                                         */
+/*                                                                            */
+/* Every third wave you pick one of three. They stack, and they are wiped on  */
+/* death along with your weapon - so a run builds an identity, and losing it  */
+/* is what makes the next run interesting rather than identical.              */
+/*----------------------------------------------------------------------------*/
+typedef enum UpgradeId {
+    UP_VITALITY, UP_RAPID, UP_CALIBER, UP_RECOIL, UP_BIGSHOT, UP_VELOCITY,
+    UP_ASBESTOS, UP_DEATHBLAST, UP_LIFESTEAL, UP_THORNS, UP_GREED,
+    /* The ones below change what a shot DOES rather than how big its number
+       is. They are what a build ends up being remembered for. */
+    UP_AEGIS, UP_PIERCE, UP_HOMING, UP_SCATTER, UP_BACKBLAST, UP_COUNT
+} UpgradeId;
+
+/* Two knobs decide how an upgrade feels over a long run:
+ *
+ *   maxStacks - 0 means it never runs out. The plain stat boosts are left
+ *               uncapped so a deep run really does turn absurd; the ones that
+ *               change a rule (extra pellets, a shield, homing) get a ceiling,
+ *               because those stop being "stronger" and start being "different
+ *               game" once they pile up.
+ *
+ *   weight    - relative odds of being offered. Bread-and-butter upgrades come
+ *               up constantly, build-defining ones are a lucky roll.
+ */
+typedef struct UpgradeDef {
+    const char *name;
+    const char *desc;
+    int         maxStacks;      /* 0 = unlimited */
+    int         weight;         /* higher = offered more often */
+    Color       color;
+} UpgradeDef;
+
+static const UpgradeDef UPGRADES[UP_COUNT] = {
+    /* name        desc                                cap odds  colour */
+    /* Every description is ONE line: each card also prints a live value line
+       underneath it (UpgradeValue), and a second wrapped line would collide. */
+    { "활력",      "최대 체력 +1 즉시 회복",              0, 100, { 120, 255, 170, 255 } },
+    { "속사",      "발사 속도 12% 증가",                  8,  55, { 255, 225, 120, 255 } },
+    { "고화력",    "공격력 25% 증가",                     0,  95, { 255, 140, 120, 255 } },
+    { "강반동",    "반동 12% 증가",       0,  90, { 150, 200, 255, 255 } },
+    { "대구경",    "탄환 크기 30% 증가",                  0,  80, { 200, 160, 255, 255 } },
+    /* Speed is range as well as travel time - the fuse length is fixed, so a
+       faster shot also reaches further before it expires. That is most of what
+       makes it worth a card slot on the short-lived guns. */
+    { "고속탄",    "탄환 속도 20% 증가",                  0,  75, { 140, 225, 255, 255 } },
+    { "내화복",    "지면 허용 시간 +0.6초",               0,  70, { 255, 180,  90, 255 } },
+    { "연쇄 폭발", "처치 시 주변 적 피해",                5,  40, { 255, 120,  90, 255 } },
+    { "흡혈",      "처치 시 확률로 회복",                 4,  45, { 120, 255, 210, 255 } },
+    { "가시",      "반격 폭발 + 확률 회복",               5,  45, { 255, 160, 220, 255 } },
+    { "탐욕",      "점수 30% 증가",                       0,  85, { 255, 235, 140, 255 } },
+    /* The rule-changers. Capped, and rare enough that landing one reads as the
+       run turning a corner rather than as the default plan. */
+    { "방어막",    "피격을 확률로 무력화",                5,  28, { 120, 210, 255, 255 } },
+    { "관통",      "탄이 적을 관통",                      5,  32, { 255, 245, 190, 255 } },
+    { "유도",      "탄이 적을 추적",                      3,  26, { 190, 255, 140, 255 } },
+    /* The strongest thing in the game: one stack multiplies the output of
+       every weapon at once, and four is already a wall of shot. */
+    { "산탄화",    "탄 1발 추가 발사",                    4,  18, { 255, 190, 130, 255 } },
+    { "반동 폭풍", "발사 시 뒤로 충격파",                 5,  26, { 180, 160, 255, 255 } }
+};
+
+static int upStacks[UP_COUNT];
+static int upChoices[3];
+static int   pendingPicks;      /* boss clears grant two picks instead of one */
+static float upgradeT;          /* seconds since the choice screen appeared */
+
+/* The screen fades in, and ignores input until it has. Appearing instantly
+   meant a shot fired on the last frame of a wave could pick a card by accident. */
+#define UPGRADE_FADE 0.45f
+static int blastDepth;          /* guards DEATH BLAST against runaway chains */
+
+static int   PlayerMaxHp(void)  { return PLAYER_MAX_HP + upStacks[UP_VITALITY]; }
+/* Compounding, and uncapped like everything else - but the fire interval is
+   what rations flight, so it is kept off zero. At 0.88^n that floor is only
+   reached somewhere past 30 stacks; it exists so the maths cannot degenerate,
+   not to balance anything. */
+/* Every effect is written once, as a function of a stack COUNT, and the live
+   getters below just feed it the current count. The upgrade card prints the
+   same functions at n and n+1 - so the number a card promises is by
+   construction the number the game will use, and the two can never drift. */
+static float FireMulAt(int n)
+{
+    float m = powf(0.88f, (float)n);
+    return (m < 0.02f) ? 0.02f : m;
+}
+static float DamageMulAt(int n)  { return 1.0f + 0.25f * n; }
+static float RecoilMulAt(int n)  { return 1.0f + 0.12f * n; }
+static float SizeMulAt(int n)    { return 1.0f + 0.30f * n; }
+static float SpeedMulAt(int n)   { return 1.0f + 0.20f * n; }
+static float ScoreMulAt(int n)   { return 1.0f + 0.30f * n; }
+static float GroundTimeAt(int n) { return tune.groundTime + 0.6f * n; }
+static float BlastRadiusAt(int n){ return 62.0f + 26.0f * n; }
+
+static float UpFireMul(void)    { return FireMulAt(upStacks[UP_RAPID]); }
+static float UpDamageMul(void)  { return DamageMulAt(upStacks[UP_CALIBER]); }
+static float UpRecoilMul(void)  { return RecoilMulAt(upStacks[UP_RECOIL]); }
+static float UpSizeMul(void)    { return SizeMulAt(upStacks[UP_BIGSHOT]); }
+static float UpSpeedMul(void)   { return SpeedMulAt(upStacks[UP_VELOCITY]); }
+static float UpScoreMul(void)   { return ScoreMulAt(upStacks[UP_GREED]); }
+static float UpGroundTime(void) { return GroundTimeAt(upStacks[UP_ASBESTOS]); }
+
+/* Single source of truth: the ring drawn on screen and the circle the damage
+   loop tests against must never be allowed to disagree. */
+static float DeathBlastRadius(void) { return BlastRadiusAt(upStacks[UP_DEATHBLAST]); }
+
+/* Stacking odds that approach a ceiling instead of marching past 100%: each
+   stack removes the same FRACTION of what is left, so the tenth stack is worth
+   much less than the first and no amount of them ever reaches certainty. That
+   matters here because these three all cancel or undo damage - a linear roll
+   would hit 100% and quietly turn the run invincible. */
+static float StackChance(int stacks, float perStack)
+{
+    if (stacks <= 0) return 0.0f;
+    return 1.0f - powf(1.0f - perStack, (float)stacks);
+}
+
+static bool RollChance(float p)
+{
+    return (p > 0.0f) && (RandF(0.0f, 1.0f) < p);
+}
+
+/* AEGIS negates the hit outright: 13% a stack, so 1/2/3/4/5 stacks read as
+   13 / 24 / 34 / 43 / 50 percent.
+
+   THORNS still blasts whoever landed the hit; its heal can only ever give back
+   the point you just lost, never revive you. LIFESTEAL rolls on every kill, so
+   its per-stack number has to stay small.
+
+   These live as constants because the upgrade card prints them back to the
+   player - a card promising odds the roll did not use would be worse than a
+   card promising nothing. */
+#define AEGIS_PER_STACK      0.13f
+#define THORNS_HEAL_PER      0.14f
+#define LIFESTEAL_PER_STACK  0.04f
+
+static float AegisChance(void)      { return StackChance(upStacks[UP_AEGIS],     AEGIS_PER_STACK); }
+static float ThornsHealChance(void) { return StackChance(upStacks[UP_THORNS],    THORNS_HEAL_PER); }
+static float LifestealChance(void)  { return StackChance(upStacks[UP_LIFESTEAL], LIFESTEAL_PER_STACK); }
+
+/* BACKBLAST rides the recoil, so a heavier gun throws a heavier wave. That
+   keeps it worth roughly the same on an SMG as on a BAZOOKA. */
+static float BackblastRadius(const WeaponDef *w)
+{
+    return (58.0f + 22.0f * upStacks[UP_BACKBLAST]) * (0.7f + 0.3f * w->recoilMul);
+}
+
+/* The line every upgrade card carries: where the stat stands right now, and
+   what this pick would move it to.
+ *
+ * The description above already says how much one stack is worth. What it
+ * cannot say is where you actually are - five upgrades into a run nobody is
+ * computing 1.25^n in their head, and "+25% damage" stops meaning anything.
+ *
+ * Both halves come from the same *At() functions the simulation runs on, so a
+ * card can never advertise a number the game disagrees with. */
+static const char *UpgradeValue(int id)
+{
+    int n = upStacks[id];
+
+    switch (id)
+    {
+        case UP_VITALITY:
+            return TextFormat("체력 %d → %d", PLAYER_MAX_HP + n, PLAYER_MAX_HP + n + 1);
+
+        /* Named "간격" rather than "속도" because lower is better here, and the
+           number shrinking while the card says "증가" would read as a bug. */
+        case UP_RAPID:
+            return TextFormat("연사 간격 %.0f%% → %.0f%%",
+                              FireMulAt(n) * 100.0f, FireMulAt(n + 1) * 100.0f);
+
+        case UP_CALIBER:
+            return TextFormat("공격력 %.0f%% → %.0f%%",
+                              DamageMulAt(n) * 100.0f, DamageMulAt(n + 1) * 100.0f);
+        case UP_RECOIL:
+            return TextFormat("반동 %.0f%% → %.0f%%",
+                              RecoilMulAt(n) * 100.0f, RecoilMulAt(n + 1) * 100.0f);
+        case UP_BIGSHOT:
+            return TextFormat("탄 크기 %.0f%% → %.0f%%",
+                              SizeMulAt(n) * 100.0f, SizeMulAt(n + 1) * 100.0f);
+
+        /* Says so out loud when the gun in your hands has no projectile to
+           speed up. The stat is still bought and still applies to every other
+           weapon you might pick up - a card that quietly did nothing would read
+           as a bug, and one that hid itself would break the weighted roll. */
+        case UP_VELOCITY:
+            if (WEAPONS[player.weapon].hitscan) return "즉발 무기에는 효과 없음";
+            return TextFormat("탄속 %.0f%% → %.0f%%",
+                              SpeedMulAt(n) * 100.0f, SpeedMulAt(n + 1) * 100.0f);
+        case UP_GREED:
+            return TextFormat("점수 %.0f%% → %.0f%%",
+                              ScoreMulAt(n) * 100.0f, ScoreMulAt(n + 1) * 100.0f);
+
+        case UP_ASBESTOS:
+            return TextFormat("지면 %.1f초 → %.1f초",
+                              GroundTimeAt(n), GroundTimeAt(n + 1));
+
+        case UP_DEATHBLAST:
+            return (n <= 0) ? TextFormat("반경 %.0f", BlastRadiusAt(1))
+                            : TextFormat("반경 %.0f → %.0f",
+                                         BlastRadiusAt(n), BlastRadiusAt(n + 1));
+
+        /* Chance upgrades name what the odds measure - on THORNS the number is
+           the heal, not the blast, and a bare "26%" would not say which. */
+        case UP_AEGIS:
+            return (n <= 0)
+                ? TextFormat("무력화 %.0f%%", StackChance(1, AEGIS_PER_STACK) * 100.0f)
+                : TextFormat("무력화 %.0f%% → %.0f%%",
+                             StackChance(n,     AEGIS_PER_STACK) * 100.0f,
+                             StackChance(n + 1, AEGIS_PER_STACK) * 100.0f);
+        case UP_THORNS:
+            return (n <= 0)
+                ? TextFormat("회복 %.0f%%", StackChance(1, THORNS_HEAL_PER) * 100.0f)
+                : TextFormat("회복 %.0f%% → %.0f%%",
+                             StackChance(n,     THORNS_HEAL_PER) * 100.0f,
+                             StackChance(n + 1, THORNS_HEAL_PER) * 100.0f);
+        case UP_LIFESTEAL:
+            return (n <= 0)
+                ? TextFormat("회복 %.0f%%", StackChance(1, LIFESTEAL_PER_STACK) * 100.0f)
+                : TextFormat("회복 %.0f%% → %.0f%%",
+                             StackChance(n,     LIFESTEAL_PER_STACK) * 100.0f,
+                             StackChance(n + 1, LIFESTEAL_PER_STACK) * 100.0f);
+
+        case UP_PIERCE:  return TextFormat("관통 %d → %d",   n, n + 1);
+        case UP_HOMING:  return TextFormat("추적 %d → %d",   n, n + 1);
+        case UP_SCATTER: return TextFormat("추가 탄 %d → %d", n, n + 1);
+
+        /* Scales with whatever is in your hands, so it is quoted for that gun. */
+        case UP_BACKBLAST:
+        {
+            const WeaponDef *w = &WEAPONS[player.weapon];
+            float k    = 0.7f + 0.3f * w->recoilMul;
+            float now  = (58.0f + 22.0f * n)       * k;
+            float next = (58.0f + 22.0f * (n + 1)) * k;
+            return (n <= 0) ? TextFormat("반경 %.0f", next)
+                            : TextFormat("반경 %.0f → %.0f", now, next);
+        }
+    }
+    return NULL;
+}
+
+static bool UpgradeMaxed(int id)
+{
+    int cap = UPGRADES[id].maxStacks;
+    return (cap > 0 && upStacks[id] >= cap);
+}
+
+/* Offer three distinct upgrades, drawn by weight so the plain stat boosts show
+   up far more often than the rule-changers.
+ *
+ * Six upgrades have no ceiling at all, so the candidate list can never fall
+ * below three and the screen can never run out of cards - but the -1 fallback
+ * stays anyway, because the drawing code already handles it and a silently
+ * empty card is a much worse failure than a missing one. */
+static void RollUpgrades(void)
+{
+    int cand[UP_COUNT], n = 0;
+    for (int i = 0; i < UP_COUNT; i++)
+        if (!UpgradeMaxed(i)) cand[n++] = i;
+
+    for (int slot = 0; slot < 3; slot++)
+    {
+        if (n == 0) { upChoices[slot] = -1; continue; }
+
+        int total = 0;
+        for (int i = 0; i < n; i++) total += UPGRADES[cand[i]].weight;
+
+        int roll = GetRandomValue(0, total - 1);
+        int pick = n - 1;                   /* also the guard if weights are odd */
+        for (int i = 0; i < n; i++)
+        {
+            roll -= UPGRADES[cand[i]].weight;
+            if (roll < 0) { pick = i; break; }
+        }
+
+        upChoices[slot] = cand[pick];
+        cand[pick] = cand[--n];             /* drawn without replacement */
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Audio - every sound is generated in code, no WAV files on disk             */
+/*----------------------------------------------------------------------------*/
+#define SFX_VOICES 5
+
+typedef struct SfxPool {
+    Sound voice[SFX_VOICES];
+    int   next;
+} SfxPool;
+
+typedef enum SfxWave { SW_SINE, SW_SQUARE, SW_SAW } SfxWave;
+
+static SfxPool sfxShoot, sfxHit, sfxKill, sfxBoom, sfxHurt, sfxReload, sfxWave, sfxWarn;
+static bool    audioReady = false;
+
+static Sound SynthSound(SfxWave shape, float f0, float f1, float duration,
+                        float noiseMix, float envPow, float volume)
+{
+    const int sampleRate = 22050;
+    int   frames = (int)(sampleRate * duration);
+    short *data  = (short *)MemAlloc(frames * sizeof(short));
+    float phase  = 0.0f;
+    unsigned int rng = 0x1234567u;
+    float lowpass = 0.0f;
+
+    for (int i = 0; i < frames; i++)
+    {
+        float t = (float)i / (float)frames;
+        float f = f0 + (f1 - f0) * t;
+
+        phase += f / sampleRate;
+        if (phase >= 1.0f) phase -= 1.0f;
+
+        float tone = 0.0f;
+        switch (shape)
+        {
+            case SW_SINE:   tone = sinf(phase * 2.0f * PI);      break;
+            case SW_SQUARE: tone = (phase < 0.5f) ? 1.0f : -1.0f; break;
+            case SW_SAW:    tone = 2.0f * phase - 1.0f;           break;
+        }
+
+        rng = rng * 1664525u + 1013904223u;
+        float noise = ((float)((rng >> 9) & 0xFFFF) / 32767.5f) - 1.0f;
+        lowpass += (noise - lowpass) * 0.45f;   /* take the edge off the hiss */
+
+        float s   = tone * (1.0f - noiseMix) + lowpass * noiseMix;
+        float env = powf(1.0f - t, envPow);
+        float atk = fminf(1.0f, (float)i / (sampleRate * 0.003f));
+        float v   = s * env * atk * volume;
+
+        if (v >  1.0f) v =  1.0f;
+        if (v < -1.0f) v = -1.0f;
+        data[i] = (short)(v * 32000.0f);
+    }
+
+    Wave w = { (unsigned int)frames, sampleRate, 16, 1, data };
+    Sound snd = LoadSoundFromWave(w);
+    MemFree(data);
+    return snd;
+}
+
+static SfxPool MakePool(SfxWave shape, float f0, float f1, float dur,
+                        float noiseMix, float envPow, float vol)
+{
+    SfxPool p = { 0 };
+    p.voice[0] = SynthSound(shape, f0, f1, dur, noiseMix, envPow, vol);
+    for (int i = 1; i < SFX_VOICES; i++) p.voice[i] = LoadSoundAlias(p.voice[0]);
+    p.next = 0;
+    return p;
+}
+
+static void UnloadPool(SfxPool *p)
+{
+    for (int i = SFX_VOICES - 1; i >= 1; i--) UnloadSoundAlias(p->voice[i]);
+    UnloadSound(p->voice[0]);
+}
+
+static void PlaySfx(SfxPool *p, float pitch)
+{
+    if (!audioReady) return;
+    Sound s = p->voice[p->next];
+    p->next = (p->next + 1) % SFX_VOICES;
+    SetSoundPitch(s, pitch);
+    PlaySound(s);
+}
+
+static void InitSfx(void)
+{
+    InitAudioDevice();
+    if (!IsAudioDeviceReady()) return;
+    audioReady = true;
+    SetMasterVolume(0.65f);
+
+    sfxShoot  = MakePool(SW_SQUARE, 520.0f, 120.0f, 0.09f, 0.35f, 2.2f, 0.40f);
+    sfxHit    = MakePool(SW_SQUARE, 900.0f, 420.0f, 0.06f, 0.15f, 2.5f, 0.30f);
+    sfxKill   = MakePool(SW_SAW,    340.0f,  70.0f, 0.20f, 0.55f, 1.8f, 0.45f);
+    sfxBoom   = MakePool(SW_SAW,    180.0f,  35.0f, 0.55f, 0.70f, 1.4f, 0.65f);
+    sfxHurt   = MakePool(SW_SQUARE, 220.0f,  60.0f, 0.28f, 0.30f, 1.6f, 0.55f);
+    sfxReload = MakePool(SW_SINE,   320.0f, 760.0f, 0.10f, 0.05f, 2.0f, 0.30f);
+    sfxWave   = MakePool(SW_SINE,   180.0f, 620.0f, 0.35f, 0.00f, 1.2f, 0.35f);
+    sfxWarn   = MakePool(SW_SQUARE, 130.0f, 330.0f, 0.22f, 0.10f, 0.9f, 0.30f);
+}
+
+static void ShutdownSfx(void)
+{
+    if (!audioReady) return;
+    UnloadPool(&sfxShoot);  UnloadPool(&sfxHit);   UnloadPool(&sfxKill);
+    UnloadPool(&sfxBoom);   UnloadPool(&sfxHurt);  UnloadPool(&sfxReload);
+    UnloadPool(&sfxWave);   UnloadPool(&sfxWarn);
+    CloseAudioDevice();
+}
+
+/*----------------------------------------------------------------------------*/
+/* Particles & popups                                                         */
+/*----------------------------------------------------------------------------*/
+static void EmitBurst(Vector2 pos, float dir, float arc, int count,
+                      float spdMin, float spdMax, float life, float size,
+                      Color color, float grav)
+{
+    for (int n = 0; n < count; n++)
+    {
+        for (int i = 0; i < MAX_PARTICLES; i++)
+        {
+            Particle *p = &particles[i];
+            if (p->life > 0.0f) continue;
+
+            float a = dir + RandF(-arc, arc);
+            p->pos     = pos;
+            p->vel     = FromAngle(a, RandF(spdMin, spdMax));
+            p->maxLife = life * RandF(0.65f, 1.35f);
+            p->life    = p->maxLife;
+            p->size    = size * RandF(0.6f, 1.4f);
+            p->grav    = grav;
+            p->drag    = 0.93f;
+            p->color   = color;
+            break;
+        }
+    }
+}
+
+static void AddShock(Vector2 pos, float radius, Color color)
+{
+    for (int i = 0; i < MAX_SHOCKS; i++)
+    {
+        if (shocks[i].active) continue;
+        shocks[i] = (Shock){ pos, radius, 0.42f, 0.42f, color, true };
+        return;
+    }
+}
+
+static void UpdateShocks(float dt)
+{
+    for (int i = 0; i < MAX_SHOCKS; i++)
+    {
+        if (!shocks[i].active) continue;
+        shocks[i].life -= dt;
+        if (shocks[i].life <= 0.0f) shocks[i].active = false;
+    }
+}
+
+static void DrawShocks(void)
+{
+    for (int i = 0; i < MAX_SHOCKS; i++)
+    {
+        const Shock *s = &shocks[i];
+        if (!s->active) continue;
+
+        float t = 1.0f - Clamp(s->life / s->maxLife, 0.0f, 1.0f);   /* 0 -> 1 */
+        float r = s->radius * (1.0f - powf(1.0f - t, 3.0f));        /* eases out */
+        float a = 1.0f - t;
+
+        /* sweeping front */
+        if (r > 2.0f)
+            DrawRing(s->pos, r * 0.70f, r, 0.0f, 360.0f, 48, Fade(s->color, 0.30f * a));
+
+        /* the boundary itself, held at the true damage radius the whole time so
+           the player can actually learn the range */
+        DrawRing(s->pos, s->radius - 2.0f, s->radius + 1.0f, 0.0f, 360.0f, 56,
+                 Fade(s->color, 0.55f * a));
+    }
+}
+
+static void AddPopupEx(Vector2 pos, int value, const char *label, Color color)
+{
+    for (int i = 0; i < MAX_POPUPS; i++)
+    {
+        if (popups[i].active) continue;
+        popups[i].active = true;
+        popups[i].pos    = pos;
+        popups[i].life   = 0.8f;
+        popups[i].value  = value;
+        popups[i].label  = label;
+        popups[i].color  = color;
+        return;
+    }
+}
+
+static void AddPopup(Vector2 pos, int value, Color color)
+{
+    AddPopupEx(pos, value, NULL, color);
+}
+
+static void UpdateParticles(float dt)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++)
+    {
+        Particle *p = &particles[i];
+        if (p->life <= 0.0f) continue;
+
+        p->life -= dt;
+        p->vel.y += p->grav * dt;
+        float d = powf(p->drag, dt * 60.0f);
+        p->vel = Vector2Scale(p->vel, d);
+        p->pos = Vector2Add(p->pos, Vector2Scale(p->vel, dt));
+    }
+
+    for (int i = 0; i < MAX_POPUPS; i++)
+    {
+        if (!popups[i].active) continue;
+        popups[i].life -= dt;
+        popups[i].pos.y -= 40.0f * dt;
+        if (popups[i].life <= 0.0f) popups[i].active = false;
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Bullets                                                                    */
+/*----------------------------------------------------------------------------*/
+static void SpawnBullet(Vector2 pos, Vector2 vel, float radius, float life,
+                        bool fromPlayer, int bounces, Color color)
+{
+    for (int i = 0; i < MAX_BULLETS; i++)
+    {
+        if (bullets[i].active) continue;
+        bullets[i] = (Bullet){ pos, vel, radius, life, life, 1.0f, 0.0f, bounces,
+                               0, -1, fromPlayer, false, false, true, color };
+        return;
+    }
+}
+
+/* An enemy's thrown charge: falls, and goes off on a fuse rather than on
+   contact. Marked explosive so UpdateBullets routes its death through
+   BomberBlast instead of simply removing it. */
+static void SpawnEnemyBomb(Vector2 pos, Vector2 vel, float fuse, Color color)
+{
+    for (int i = 0; i < MAX_BULLETS; i++)
+    {
+        if (bullets[i].active) continue;
+        bullets[i] = (Bullet){ pos, vel, 8.0f, fuse, fuse, 1.0f, BOMB_GRAV, 0,
+                               0, -1, false, true, false, true, color };
+        return;
+    }
+}
+
+/* Lob a charge so that it lands ON `target` after exactly BOMB_FLIGHT seconds.
+   Solved rather than aimed: with the flight time fixed these two components are
+   the only velocity that arrives there, which is what makes a thrown bomb read
+   as a place to leave rather than as a shot to dodge. No lead is applied
+   anywhere - it always aims at where you ARE, so moving is always right. */
+static void ThrowBombAt(Vector2 from, Vector2 target, Color c)
+{
+    Vector2 d = Vector2Subtract(target, from);
+    Vector2 v = { d.x / BOMB_FLIGHT,
+                  (d.y - 0.5f * BOMB_GRAV * BOMB_FLIGHT * BOMB_FLIGHT) / BOMB_FLIGHT };
+
+    SpawnEnemyBomb(from, v, BOMB_FLIGHT + 0.25f, c);
+}
+
+static void SpawnPlayerShot(Vector2 pos, Vector2 vel, const WeaponDef *w)
+{
+    for (int i = 0; i < MAX_BULLETS; i++)
+    {
+        if (bullets[i].active) continue;
+        bullets[i] = (Bullet){ pos, vel, w->bulletRadius * UpSizeMul(), w->life, w->life,
+                               w->damage * UpDamageMul(), w->bulletGravity, w->bounces,
+                               w->pierce + upStacks[UP_PIERCE], -1,
+                               true, w->explosive, w->slash, true, w->color };
+        return;
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Enemies                                                                    */
+/*----------------------------------------------------------------------------*/
+static Color EnemyColor(const Enemy *e);
+static void  DamageEnemy(Enemy *e, float dmg, Vector2 from);
+static void  HurtPlayer(Vector2 from);
+static void  EndRun(void);
+
+static Enemy *FreeEnemy(void)
+{
+    for (int i = 0; i < MAX_ENEMIES; i++)
+        if (!enemies[i].active) return &enemies[i];
+    return NULL;
+}
+
+/* Returns the enemy it placed, or NULL if the arena is full - callers that
+   need to adjust the newcomer (the splitting boss) use that handle. */
+static Enemy *SpawnEnemy(EnemyType type, Vector2 pos, int tier)
+{
+    Enemy *e = FreeEnemy();
+    if (!e) return NULL;
+
+    memset(e, 0, sizeof(Enemy));
+    e->type   = type;
+    e->pos    = pos;
+    e->tier   = tier;
+    e->active = true;
+    e->spawnT = 0.65f;
+    e->rot    = RandF(0.0f, 360.0f);
+
+    switch (type)
+    {
+        case EN_CHASER:
+            e->radius   = 15.0f;
+            e->maxHp    = 2.0f;
+            e->rotSpeed = RandF(-180.0f, 180.0f);
+            break;
+
+        case EN_DASHER:
+            e->radius   = 18.0f;
+            e->maxHp    = 4.0f;
+            e->rotSpeed = 55.0f;
+            e->phase    = 0;
+            break;
+
+        /* Heavier and slower off the mark than a dasher, and worth more, because
+           surviving it is three dodges rather than one. */
+        case EN_RUSHER:
+            e->radius   = 22.0f;
+            e->maxHp    = 6.0f;
+            e->rotSpeed = 35.0f;
+            e->phase    = 0;
+            e->timer    = RandF(0.4f, 1.0f);
+            e->gen      = RUSH_DASHES;
+            break;
+
+        case EN_SPLITTER:
+            e->radius   = (tier == 0) ? 24.0f : 13.0f;
+            e->maxHp    = (tier == 0) ? 4.0f : 2.0f;
+            e->rotSpeed = RandF(-90.0f, 90.0f);
+            e->timer2   = RandF(0.0f, 6.28f);
+            break;
+
+        /* Plants itself and shoots. It cannot chase you, so it punishes hanging
+           still in its line instead - the one enemy that makes the arena itself
+           feel dangerous rather than the things running at you. */
+        case EN_TURRET:
+            e->radius   = 20.0f;
+            e->maxHp    = 6.0f;
+            e->rotSpeed = 0.0f;
+            e->timer    = RandF(1.0f, 2.0f);
+            break;
+
+        /* Slow, and lethal exactly where it dies. Killing one at range is free;
+           letting it reach you costs a heart even if you never touched it. */
+        case EN_BOMBER:
+            e->radius   = 17.0f;
+            e->maxHp    = 3.0f;
+            e->rotSpeed = RandF(-70.0f, 70.0f);
+            break;
+
+        /* Fragile once the plate is gone - the shield is where its durability
+           lives, not the body behind it. */
+        case EN_SHIELDER:
+            e->radius    = 21.0f;
+            e->maxHp     = 7.0f;
+            e->shieldMax = SHIELD_HP;
+            e->rotSpeed  = 0.0f;        /* a shield that spun would be unreadable */
+            e->timer2    = RandF(0.0f, 2.0f * PI);  /* shield starts anywhere */
+            e->timer     = 1.0f;
+            e->phase     = 0;
+            break;
+
+        /* Stays out at range and rains arcs in. Thin, because the counter is
+           supposed to be flying at it - and flying at it is the one thing its
+           own bombs make expensive. */
+        case EN_BOMBARDIER:
+            e->radius   = 19.0f;
+            e->maxHp    = 4.0f;
+            e->rotSpeed = RandF(-40.0f, 40.0f);
+            e->timer    = RandF(1.2f, 2.2f);
+            e->timer2   = RandF(0.0f, 6.28f);       /* drift phase */
+            break;
+
+        case EN_BOSS:
+            e->radius   = (tier == BK_CHARGER) ? 40.0f :
+                          (tier == BK_VORTEX)  ? 42.0f :
+                          (tier == BK_LANCER)  ? 38.0f :
+                          (tier == BK_MORTAR)  ? 44.0f : 46.0f;
+            e->rotSpeed = 25.0f;
+            e->timer    = 2.0f;
+            e->timer2   = 6.0f;     /* first add is not immediate either */
+            e->spawnT   = 1.2f;
+            /* The charger closes distance for a living, so it gets less health
+               to chew through. The summoner gets less than it looks like it
+               should because it splits twice (see KillEnemy): seven bodies at
+               0.26 per generation add up to about 1.8x this number, which lands
+               the whole fight at roughly 1.3x a normal boss. */
+            /* The vortex never stops applying pressure - there is no recovery
+               window to punish the way the charger and the summoner have - so
+               it is the shortest fight of the four on paper.
+             *
+             * The linear term sets the opening fights; the CYCLE term is what
+             * keeps a boss a boss. Every fifth wave is another lap through the
+             * roster, and by then the player has had four to six more upgrade
+             * picks - compounding ones. So the boss compounds too, per lap
+             * rather than per wave: lap 1 is untouched, lap 4 (wave 20) is
+             * about 2.2x, lap 6 (wave 30) about 3.7x. Bosses are the only
+             * enemy that should ever feel like a wall, which is why this is
+             * far steeper than the rank-and-file ramp above. */
+            {
+                int   lap    = wave / 5;    /* 1 at wave 5, 6 at wave 30 */
+                float growth = powf(BOSS_LAP_GROWTH, (float)(lap - 1));
+
+                e->maxHp = (26.0f + wave * 5.0f) * growth *
+                           ((tier == BK_CHARGER) ? 0.78f :
+                            (tier == BK_SUMMONER) ? 0.72f :
+                            (tier == BK_VORTEX) ? 0.85f :
+                            (tier == BK_BULWARK) ? 0.70f :
+                            (tier == BK_LANCER) ? 0.80f :
+                            (tier == BK_MORTAR) ? 0.90f : 1.0f);
+            }
+
+            /* The bulwark keeps half its durability OUTSIDE its body, in a
+               plate you are meant to go around rather than through. Flank it
+               and the fight is the shortest of the seven; stand in front and
+               you pay for both pools. `timer2` is the plate's angle here, not
+               an add timer - each kind reads these fields its own way. */
+            if (tier == BK_BULWARK)
+            {
+                e->shieldMax = e->maxHp * 0.5f;
+                e->timer2    = RandF(0.0f, 2.0f * PI);
+            }
+            break;
+    }
+    /* Enemy counts hit their caps around wave 8-12, after which every wave
+       would be identical. Rather than flooding the screen (which just gets
+       unreadable), late waves keep escalating through health instead. Early
+       waves are untouched, so the opening stays exactly as tuned.
+     *
+     * Past wave 16 a second, COMPOUNDING term joins the linear one. The linear
+     * ramp alone loses: upgrades compound (each pick multiplies what the last
+     * one built on), so a straight line falls further behind every wave, and
+     * somewhere in the twenties the run stops being a fight. 3.5% a wave is
+     * deliberately small - it is worth nothing at wave 17 and about +60% by
+     * wave 30, which is meant to restore a difficulty curve, not a wall. */
+    if (type != EN_BOSS)        /* the boss already scales its own health */
+    {
+        float over = (float)wave - 8.0f;
+        float mul  = (over > 0.0f) ? 1.0f + 0.10f * over : 1.0f;
+
+        float late = (float)wave - 16.0f;
+        if (late > 0.0f) mul *= powf(1.035f, late);
+
+        e->maxHp     *= mul;
+        e->shieldMax *= mul;    /* zero for everything without a plate */
+    }
+
+    e->hp     = e->maxHp;
+    e->shield = e->shieldMax;
+
+    /* Ground spawns burst upward out of the floor, so the telegraph reads as
+       something climbing out rather than blinking into existence. */
+    if (pos.y > GROUND_Y - 70.0f)
+    {
+        e->vel = (Vector2){ RandF(-70.0f, 70.0f), RandF(-300.0f, -180.0f) };
+        EmitBurst((Vector2){ pos.x, (float)GROUND_Y }, -PI / 2.0f, 0.5f, 14,
+                  90.0f, 300.0f, 0.45f, 4.0f, EnemyColor(e), 320.0f);
+    }
+    return e;
+}
+
+/* The player lives high up (the floor burns), so pressure has to come from
+   below to mean anything. Most enemies climb out of the ground; the rest come
+   in low from the sides. Nothing drops from above any more. */
+static Vector2 RandomEdgeSpawn(void)
+{
+    int side = GetRandomValue(0, 4);
+    if (side <= 2) return (Vector2){ RandF(90.0f, SCREEN_W - 90.0f), GROUND_Y - 26.0f };
+    if (side == 3) return (Vector2){ -40.0f, RandF(GROUND_Y - 280.0f, GROUND_Y - 60.0f) };
+    return (Vector2){ SCREEN_W + 40.0f, RandF(GROUND_Y - 280.0f, GROUND_Y - 60.0f) };
+}
+
+static int EnemyScore(const Enemy *e)
+{
+    switch (e->type)
+    {
+        case EN_CHASER:   return 100;
+        case EN_DASHER:   return 200;
+        case EN_RUSHER:   return 320;
+        case EN_SPLITTER: return (e->tier == 0) ? 120 : 60;
+        case EN_TURRET:   return 250;
+        case EN_BOMBER:   return 150;
+        case EN_BOMBARDIER: return 280;
+        /* Paid for the flying you had to do, not for the health you chewed. */
+        case EN_SHIELDER: return 300;
+        /* A summoner pays out across the bodies it breaks into rather than all
+           at once. Halving per generation while the count doubles means every
+           generation is worth the same 900, so all three together still come to
+           the 2700 the fight has always paid. */
+        case EN_BOSS:     return (e->tier == BK_SUMMONER) ? (900 >> e->gen) : 2000;
+    }
+    return 0;
+}
+
+static Color EnemyColor(const Enemy *e)
+{
+    switch (e->type)
+    {
+        case EN_CHASER:   return (Color){ 255,  80,  90, 255 };
+        case EN_DASHER:   return (Color){ 255, 170,  40, 255 };
+        /* Reads as a hotter dasher, because that is what it is. */
+        case EN_RUSHER:   return (Color){ 255,  95,  30, 255 };
+        case EN_SPLITTER: return (Color){ 190, 100, 255, 255 };
+        case EN_TURRET:   return (Color){ 255, 215,  90, 255 };
+        case EN_BOMBER:   return (Color){ 255, 120,  55, 255 };
+        /* Olive: close enough to the suicide bomber to say "explosives", far
+           enough that you never mistake one for the other at a glance. */
+        case EN_BOMBARDIER: return (Color){ 180, 200,  80, 255 };
+        /* Steel, and the only cold colour in the roster - it is the one enemy
+           you are meant to read as armour rather than as an animal. */
+        case EN_SHIELDER: return (Color){ 130, 190, 220, 255 };
+        case EN_BOSS:
+            /* each boss kind gets its own colour - you should know what you are
+               fighting before it has done anything */
+            if (e->tier == BK_SUMMONER) return (Color){ 170,  95, 255, 255 };
+            if (e->tier == BK_CHARGER)  return (Color){ 255, 130,  40, 255 };
+            if (e->tier == BK_VORTEX)   return (Color){  90, 225, 235, 255 };
+            /* The back three echo the enemy they are the big version of. */
+            if (e->tier == BK_BULWARK)  return (Color){ 165, 205, 235, 255 };
+            if (e->tier == BK_LANCER)   return (Color){ 255,  85,  45, 255 };
+            if (e->tier == BK_MORTAR)   return (Color){ 205, 225,  95, 255 };
+            return (Color){ 255, 60, 160, 255 };
+    }
+    return RED;
+}
+
+/* Does a direct hit arriving from `from` land on the shielder's shield rather
+   than on the thing behind it? Only ever true for a SHIELDER, so callers can
+   ask without checking the type first.
+
+   Deliberately NOT folded into DamageEnemy: everything that routes through
+   there without a meaningful direction - explosions, backblast, death blast,
+   thorns - is supposed to go straight through the shield. Blocking belongs to
+   the two places that fire something along a line, and nowhere else. */
+/* The shielder and its boss-sized version share every rule about plates. */
+static bool HasShield(const Enemy *e)
+{
+    return (e->type == EN_SHIELDER) ||
+           (e->type == EN_BOSS && e->tier == BK_BULWARK);
+}
+
+static bool ShieldBlocks(const Enemy *e, Vector2 from)
+{
+    if (!HasShield(e) || e->shield <= 0.0f) return false;
+
+    Vector2 d = Vector2Subtract(from, e->pos);
+    if (Vector2LengthSqr(d) < 0.0001f) return false;    /* dead centre: no side */
+
+    return fabsf(AngleDelta(atan2f(d.y, d.x), e->timer2)) < SHIELD_ARC;
+}
+
+/* The spark that tells you the shot did nothing. Loud on purpose - a hit that
+   silently fails to damage reads as the game dropping your input.
+ *
+ * `from` is where the shot came from, not where it struck: a beam is tested
+ * against its muzzle half a screen away, so the sparks are placed on the shield
+ * surface here rather than by the caller. */
+static void ShieldHit(Enemy *e, float dmg, Vector2 from, Color c)
+{
+    Vector2 d  = Vector2Subtract(from, e->pos);
+    float   a  = (Vector2LengthSqr(d) > 0.0001f) ? atan2f(d.y, d.x) : e->timer2;
+    Vector2 at = Vector2Add(e->pos, FromAngle(a, e->radius + 8.0f));
+
+    e->guardT = 0.22f;
+    e->shield -= dmg;
+
+    if (e->shield > 0.0f)
+    {
+        EmitBurst(at, a, 0.9f, 7, 90.0f, 300.0f, 0.28f, 3.0f, c, 120.0f);
+        PlaySfx(&sfxHit, 1.9f);
+        return;
+    }
+
+    /* Gone for good - the plate does not come back, so the work you put into
+       breaking it is banked. Announced loudly, because the enemy is a
+       completely different proposition from this frame on. */
+    e->shield = 0.0f;
+    EmitBurst(at, a, 1.5f, 26, 120.0f, 460.0f, 0.55f, 4.5f,
+              (Color){ 225, 245, 255, 255 }, 260.0f);
+    AddShake(5.0f);
+    PlaySfx(&sfxBoom, 1.6f);
+}
+
+static float ComboMultiplier(void)
+{
+    float m = 1.0f + player.combo * 0.5f;
+    return (m > 10.0f) ? 10.0f : m;
+}
+
+/* A bomber going off. Unlike the player's own explosions this one hurts, and
+   it does not care whose side anything is on.
+ *
+ * `radius` is a parameter because the same blast serves the suicide bomber and
+ * the bombardier's thrown charge, and those two have to be different sizes or
+ * the thrown one - which arrives from off-screen and costs the enemy nothing -
+ * would be strictly the better version of walking into you. */
+static void BomberBlast(Vector2 pos, float radius)
+{
+    Color fire = { 255, 130, 60, 255 };
+
+    if (player.alive &&
+        Vector2Distance(player.pos, pos) < radius + PLAYER_RADIUS)
+        HurtPlayer(pos);
+
+    /* Friendly fire, one level deep only - a packed cluster should reward a
+       well-placed shot, not erase the whole wave in a single frame. */
+    if (blastDepth < 1)
+    {
+        blastDepth++;
+        for (int i = 0; i < MAX_ENEMIES; i++)
+        {
+            Enemy *o = &enemies[i];
+            if (!o->active || o->spawnT > 0.0f) continue;
+            if (Vector2Distance(o->pos, pos) > radius + o->radius) continue;
+            DamageEnemy(o, 3.0f, pos);
+        }
+        blastDepth--;
+    }
+
+    /* Everything visual is scaled off the radius, so the flash always tells the
+       truth about how far the blast reached. */
+    float k = radius / BOMBER_RADIUS;
+    AddShock(pos, radius, fire);
+    EmitBurst(pos, 0.0f, PI, (int)(38 * k), 90.0f, 460.0f * k, 0.5f, 6.0f, fire, 240.0f);
+    EmitBurst(pos, 0.0f, PI, 12, 30.0f, 140.0f, 0.7f, 8.0f,
+              (Color){ 255, 240, 200, 255 }, 30.0f);
+    AddShake(9.0f * k);
+    PlaySfx(&sfxBoom, 1.3f + 0.3f * (1.0f - k));
+}
+
+static void KillEnemy(Enemy *e, bool byPlayer)
+{
+    /* READ EVERYTHING OFF `e` FIRST, AND NEVER TOUCH IT AGAIN AFTER A SPAWN.
+       This function deactivates the corpse and then spawns from its position,
+       and FreeEnemy() hands out the first inactive slot - which is very often
+       this one. The newcomer's memset then wipes `e` under our feet. That is
+       not theoretical: it is what made the summoner split forever, because
+       `ch->gen = e->gen + 1` read a freshly-zeroed gen and so every fragment
+       came out as generation 1, no matter how deep the fight already was.
+       Fragments were also born at radius 0 and health 0 for the same reason. */
+    const EnemyType type   = e->type;
+    const int       tier   = e->tier;
+    const int       gen    = e->gen;
+    const Vector2   pos    = e->pos;
+    const float     radius = e->radius;
+    const float     maxHp  = e->maxHp;
+    const int       payout = EnemyScore(e);
+    const Color     c      = EnemyColor(e);
+
+    e->active = false;
+
+    if (type == EN_BOMBER) BomberBlast(pos, BOMBER_RADIUS);
+
+    EmitBurst(pos, 0.0f, PI, (type == EN_BOSS) ? 90 : 22,
+              60.0f, (type == EN_BOSS) ? 520.0f : 300.0f,
+              0.6f, radius * 0.35f, c, 260.0f);
+    EmitBurst(pos, 0.0f, PI, 8, 20.0f, 90.0f, 0.9f, radius * 0.5f,
+              (Color){ 255, 255, 255, 255 }, 40.0f);
+
+    if (type == EN_BOSS)
+    {
+        /* Fragments announce themselves, but a full boss-death flash per body
+           would be exhausting - so only the original gets the works. */
+        float k = (gen > 0) ? 0.40f : 1.0f;
+        AddShake(20.0f * k);
+        flashWhite = 0.5f * k;
+        PlaySfx(&sfxBoom, RandF(0.9f, 1.05f) + 0.25f * gen);
+    }
+    else
+    {
+        AddShake(4.0f);
+        PlaySfx(&sfxKill, RandF(0.9f, 1.2f));
+    }
+
+    if (type == EN_SPLITTER && tier == 0)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            Vector2 p = Vector2Add(pos, FromAngle(RandF(0.0f, 2.0f * PI), 18.0f));
+            SpawnEnemy(EN_SPLITTER, p, 1);
+        }
+    }
+
+    /* The purple boss comes apart the way the purple ordinary enemy does, and
+       does it twice - seven bodies. What keeps that readable is that the
+       fragments LOSE something: only the original summons and fires its
+       five-shot fan, everything it breaks into has no guns at all and simply
+       charges. So the fight gets busier while each individual threat gets
+       simpler and flimsier, down to quarters that die in a shot or two. */
+    if (type == EN_BOSS && tier == BK_SUMMONER && gen < SUMMONER_SPLITS)
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            Vector2 p = Vector2Add(pos,
+                                   FromAngle(RandF(0.0f, 2.0f * PI), radius * 0.7f));
+            Enemy  *ch = SpawnEnemy(EN_BOSS, p, BK_SUMMONER);
+            if (ch == NULL) break;          /* arena full - just do not split */
+
+            ch->gen    = gen + 1;
+            ch->radius = radius * SUMMONER_CHILD_R;
+            ch->maxHp  = maxHp  * SUMMONER_CHILD_HP;
+            ch->hp     = ch->maxHp;
+            /* Each generation telegraphs a little quicker than the last, so the
+               later rounds feel like a burst rather than another slow reveal. */
+            ch->spawnT = 0.45f - 0.10f * gen;
+            ch->timer  = RandF(0.6f, 1.2f); /* staggered so they never fire in unison */
+            ch->timer2 = RandF(1.2f, 2.4f);
+            ch->vel    = FromAngle(RandF(0.0f, 2.0f * PI), RandF(150.0f, 260.0f));
+        }
+    }
+
+    if (!byPlayer) return;
+
+    /* No-touch combo: every airborne kill stacks the multiplier. */
+    if (!player.grounded) { player.combo++; player.comboFlash = 0.45f; }
+
+    int gained = (int)(payout * ComboMultiplier() * UpScoreMul());
+    score += gained;
+    AddPopup(pos, gained, c);
+
+    hitstop = 0.045f;
+
+    /* DEATH BLAST: chains, but only one level deep so a big wave cannot
+       cascade into an instant screen wipe. */
+    if (upStacks[UP_DEATHBLAST] > 0 && blastDepth < 1)
+    {
+        float   blastR = DeathBlastRadius();
+        float   dmg    = 1.5f * upStacks[UP_DEATHBLAST];
+        Vector2 at     = pos;
+        Color   fire   = (Color){ 255, 150, 100, 255 };
+
+        blastDepth++;
+        for (int i = 0; i < MAX_ENEMIES; i++)
+        {
+            Enemy *o = &enemies[i];
+            /* `o == e` is no longer a self-check - the corpse is inactive, and
+               anything living in that slot now is a freshly spawned fragment,
+               which the spawnT test skips anyway. */
+            if (!o->active || o->spawnT > 0.0f) continue;
+            if (Vector2Distance(o->pos, at) > blastR + o->radius) continue;
+            DamageEnemy(o, dmg, at);
+        }
+        blastDepth--;
+
+        AddShock(at, blastR, fire);
+        EmitBurst(at, 0.0f, PI, 16, 80.0f, blastR * 3.0f, 0.35f, 4.0f, fire, 40.0f);
+    }
+
+    /* LIFESTEAL: every kill is its own roll. */
+    {
+        if (player.hp < PlayerMaxHp() && RollChance(LifestealChance()))
+        {
+            player.hp++;
+            AddPopupEx(player.pos, 0, "체력 +1", (Color){ 120, 255, 210, 255 });
+            PlaySfx(&sfxReload, 1.5f);
+        }
+    }
+}
+
+static void DamageEnemy(Enemy *e, float dmg, Vector2 from)
+{
+    /* A corpse still has hp <= 0, so a second hit landing on it in the same
+       frame would run KillEnemy again - and a summoner would split twice off
+       one death. Every caller filters on active already; this just makes the
+       invariant impossible to break from a new one. */
+    if (!e->active || e->spawnT > 0.0f) return;
+
+    e->hp -= dmg;
+    e->hitFlash = 0.12f;
+
+    Vector2 kick = Vector2Subtract(e->pos, from);
+    EmitBurst(e->pos, atan2f(kick.y, kick.x), 0.8f, 5, 60.0f, 220.0f, 0.25f, 3.0f,
+              (Color){ 255, 230, 160, 255 }, 200.0f);
+
+    if (e->hp <= 0.0f) KillEnemy(e, true);
+    else               PlaySfx(&sfxHit, RandF(1.0f, 1.3f));
+}
+
+/* Bazooka blast: hits everything nearby and shoves the player, so a rocket
+   fired at your own feet is a legitimate (and expensive) escape move.
+ *
+ * `tint` is the firing weapon's colour, carried in on the bullet. The blast
+ * belongs to the gun that threw it - a pink rocket has no business bursting
+ * orange - and it also means the radius ring reads as yours at a glance, even
+ * when a bomber is going off somewhere else on screen. */
+static void Explode(Vector2 pos, float damage, Color tint)
+{
+    Color fire = tint;
+
+    for (int i = 0; i < MAX_ENEMIES; i++)
+    {
+        Enemy *e = &enemies[i];
+        if (!e->active || e->spawnT > 0.0f) continue;
+        if (Vector2Distance(e->pos, pos) > BLAST_RADIUS + e->radius) continue;
+        DamageEnemy(e, damage, pos);
+    }
+
+    if (player.alive)
+    {
+        Vector2 away = Vector2Subtract(player.pos, pos);
+        float   d    = Vector2Length(away);
+        if (d < BLAST_RADIUS && d > 0.001f)
+        {
+            float k = 1.0f - d / BLAST_RADIUS;
+            player.vel = Vector2Add(player.vel,
+                                    Vector2Scale(Vector2Scale(away, 1.0f / d), 620.0f * k));
+        }
+    }
+
+    /* The ring is the same BLAST_RADIUS the loops above just tested against,
+       so a rocket's reach can be learned instead of guessed from the spray. */
+    AddShock(pos, BLAST_RADIUS, fire);
+
+    EmitBurst(pos, 0.0f, PI, 46, 90.0f, 520.0f, 0.55f, 7.0f, fire, 260.0f);
+    EmitBurst(pos, 0.0f, PI, 16, 30.0f, 160.0f, 0.8f, 9.0f,
+              (Color){ 255, 240, 200, 255 }, 40.0f);
+    AddShake(13.0f);
+    flashWhite = 0.28f;
+    PlaySfx(&sfxBoom, 1.15f);
+}
+
+/* Railgun: damages every enemy on the line at once, then leaves a fading trace. */
+static void FireBeam(Vector2 from, Vector2 dir, const WeaponDef *w)
+{
+    Vector2 to = Vector2Add(from, Vector2Scale(dir, BEAM_RANGE));
+
+    /* Single source of truth: the width the damage loop tests against and the
+       width DrawBeams strokes are the same number. The bullet weapons get the
+       size upgrade through Bullet.radius; hitscan has no projectile to carry
+       it, so it comes through here instead. */
+    float hw = BEAM_RADIUS * UpSizeMul();
+
+    for (int i = 0; i < MAX_ENEMIES; i++)
+    {
+        Enemy *e = &enemies[i];
+        if (!e->active || e->spawnT > 0.0f) continue;
+        if (DistToSegment(e->pos, from, to) > e->radius + hw) continue;
+
+        /* Hitscan is still a shot fired down a line, so the shield eats it the
+           same way it eats a bullet. It does not stop the beam for anyone
+           standing behind it, though - the beam pierces, and a shield is not
+           cover for the whole room. */
+        if (ShieldBlocks(e, from))
+        {
+            ShieldHit(e, w->damage * UpDamageMul(), from, w->color);
+            continue;
+        }
+
+        DamageEnemy(e, w->damage * UpDamageMul(), from);
+    }
+
+    for (int i = 0; i < MAX_BEAMS; i++)
+    {
+        if (beams[i].active) continue;
+        beams[i] = (Beam){ from, to, 0.22f, w->color, hw, true };
+        break;
+    }
+}
+
+static void UpdateBeams(float dt)
+{
+    for (int i = 0; i < MAX_BEAMS; i++)
+    {
+        if (!beams[i].active) continue;
+        beams[i].life -= dt;
+        if (beams[i].life <= 0.0f) beams[i].active = false;
+    }
+}
+
+static void DrawBeams(void)
+{
+    for (int i = 0; i < MAX_BEAMS; i++)
+    {
+        const Beam *b = &beams[i];
+        if (!b->active) continue;
+        float t = b->life / 0.22f;
+        /* All three layers scale together, so an unupgraded shot is drawn
+           exactly as it always was (s == 1) and every stack visibly fattens
+           the whole beam rather than just its glow. */
+        float s = b->hw / BEAM_RADIUS;
+        DrawLineEx(b->a, b->b, 16.0f * s * t, Fade(b->color, 0.20f * t));
+        DrawLineEx(b->a, b->b,  7.0f * s * t, Fade(b->color, 0.75f * t));
+        DrawLineEx(b->a, b->b,  2.5f * s * t, Fade(WHITE, 0.9f * t));
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Pickups                                                                    */
+/*                                                                            */
+/* Drops high in the arena, so the reward for being hurt is a flight challenge */
+/* rather than a free heal.                                                    */
+/*----------------------------------------------------------------------------*/
+#define PICKUP_LIFETIME  14.0f
+#define PICKUP_RADIUS    17.0f
+
+static Color PickupColor(const Pickup *p)
+{
+    if (p->kind == PK_HEAL) return (Color){ 110, 255, 170, 255 };
+    return WEAPONS[p->weapon].color;
+}
+
+static void SpawnPickup(PickupKind kind, WeaponType weapon)
+{
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        if (pickups[i].active) continue;
+
+        pickups[i].kind   = kind;
+        pickups[i].weapon = weapon;
+        pickups[i].pos    = (Vector2){ RandF(140.0f, SCREEN_W - 140.0f),
+                                       RandF(110.0f, GROUND_Y - 220.0f) };
+        pickups[i].bob    = RandF(0.0f, 6.28f);
+        pickups[i].life   = PICKUP_LIFETIME;
+        pickups[i].active = true;
+
+        EmitBurst(pickups[i].pos, 0.0f, PI, 18, 60.0f, 200.0f, 0.6f, 4.0f,
+                  PickupColor(&pickups[i]), 0.0f);
+        PlaySfx(&sfxReload, 0.7f);
+        return;
+    }
+}
+
+/* Never offer the weapon already in hand - a drop should always be a change. */
+static WeaponType RandomOtherWeapon(void)
+{
+    WeaponType w;
+    do { w = (WeaponType)GetRandomValue(1, WP_COUNT - 1); } while (w == player.weapon);
+    return w;
+}
+
+static void GivePickup(const Pickup *p, Vector2 at)
+{
+    Color c = PickupColor(p);
+
+    if (p->kind == PK_HEAL)
+    {
+        if (player.hp < PlayerMaxHp()) player.hp++;
+        AddPopupEx(at, 0, "체력 +1", c);
+    }
+    else
+    {
+        player.weapon = p->weapon;      /* kept until you die */
+        AddPopupEx(at, 0, WEAPONS[p->weapon].name, c);
+    }
+
+    EmitBurst(at, 0.0f, PI, 34, 70.0f, 340.0f, 0.7f, 5.0f, c, 60.0f);
+    flashWhite = 0.22f;
+    PlaySfx(&sfxReload, 1.4f);
+}
+
+static void UpdatePickups(float dt)
+{
+    if (healSpawnT > 0.0f)
+    {
+        healSpawnT -= dt;
+        if (healSpawnT <= 0.0f) SpawnPickup(PK_HEAL, WP_PISTOL);
+    }
+    if (weaponSpawnT > 0.0f)
+    {
+        weaponSpawnT -= dt;
+        if (weaponSpawnT <= 0.0f) SpawnPickup(PK_WEAPON, RandomOtherWeapon());
+    }
+
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        Pickup *p = &pickups[i];
+        if (!p->active) continue;
+
+        p->bob  += dt * 3.0f;
+        p->life -= dt;
+        if (p->life <= 0.0f) { p->active = false; continue; }
+
+        Vector2 at = { p->pos.x, p->pos.y + sinf(p->bob) * 5.0f };
+        if (!player.alive ||
+            !CheckCollisionCircles(at, PICKUP_RADIUS, player.pos, PLAYER_RADIUS)) continue;
+
+        p->active = false;
+        GivePickup(p, at);
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Waves                                                                      */
+/*----------------------------------------------------------------------------*/
+static void PushSpawn(EnemyType t, int count)
+{
+    for (int i = 0; i < count && spawnCount < MAX_SPAWNQUEUE; i++)
+        spawnQueue[spawnCount++] = (int)t;
+}
+
+static void ShuffleQueue(void)
+{
+    for (int i = spawnCount - 1; i > 0; i--)
+    {
+        int j = GetRandomValue(0, i);
+        int t = spawnQueue[i]; spawnQueue[i] = spawnQueue[j]; spawnQueue[j] = t;
+    }
+}
+
+static void StartWave(int n)
+{
+    wave        = n;
+    spawnCount  = 0;
+    spawnIdx    = 0;
+    spawnTimer  = (n == 1) ? 1.6f : 0.4f;   /* let the first wave settle in */
+    waveBannerT = 1.6f;
+    waveCleared = false;
+
+    /* The pause that will follow THIS wave. Beating a boss earns a real
+       breather rather than being thrown straight back into the grinder. */
+    intermission = (n % 5 == 0) ? 5.0f : 1.2f;
+    PlaySfx(&sfxWave, 1.0f);
+
+    /* A pack is offered only when you are actually hurt, and never on
+       consecutive waves - otherwise damage stops meaning anything. */
+    /* Boss waves always offer one: surviving that far should extend the run,
+       not just hand you a bigger enemy. */
+    if (player.hp < PlayerMaxHp() && (n - lastHealWave >= 2 || n % 5 == 0))
+    {
+        healSpawnT   = 4.0f;
+        lastHealWave = n;
+    }
+
+    /* A weapon shows up every other wave from wave 2 - often enough to shape a
+       run, rare enough that the pistol is still the baseline you fly on. */
+    if (n >= 2 && n - lastWeaponWave >= 2)
+    {
+        weaponSpawnT   = 7.0f;
+        lastWeaponWave = n;
+    }
+
+    if (n % 5 == 0)
+    {
+        /* The escort grows with the run but stops well short of the queue, so
+           a deep boss wave stays a boss fight rather than a swarm. */
+        int escort = 3 + n / 5;
+        if (escort > 12) escort = 12;
+
+        PushSpawn(EN_BOSS, 1);
+        PushSpawn(EN_CHASER, escort);
+        /* Deep boss waves bring the arena furniture along too: turrets deny
+           the easy hovering spots you would otherwise fight the boss from. */
+        if (n >= 15) PushSpawn(EN_TURRET, 1 + n / 25);
+
+        /* The back three bosses bring their own kind with them - the small
+           version of the mechanic you are about to fight, which is the closest
+           thing this game has to a tutorial for it. Must match the cycle in
+           UpdateSpawning exactly or the escort turns up for the wrong boss. */
+        {
+            int kind = ((n / 5) - 1) % BK_COUNT;
+            if (kind < 0) kind = 0;
+
+            if      (kind == BK_BULWARK) PushSpawn(EN_SHIELDER,   2);
+            else if (kind == BK_LANCER)  PushSpawn(EN_RUSHER,     2);
+            else if (kind == BK_MORTAR)  PushSpawn(EN_BOMBARDIER, 2);
+        }
+        ShuffleQueue();
+        /* boss first so the telegraph reads clearly */
+        for (int i = 0; i < spawnCount; i++)
+        {
+            if (spawnQueue[i] == EN_BOSS)
+            {
+                spawnQueue[i] = spawnQueue[0];
+                spawnQueue[0] = EN_BOSS;
+                break;
+            }
+        }
+        return;
+    }
+
+    /* The run never ends, so the caps cannot be flat any more - they creep up
+       with the wave instead. They still creep rather than explode: a readable
+       arena beats a crowded one, and health scaling (see SpawnEnemy) carries
+       most of the late-game difficulty. Worst case with every cap saturated is
+       51 spawns against MAX_SPAWNQUEUE's 64 - PushSpawn drops the overflow
+       silently, and the kinds pushed last are the newest ones, so this margin
+       is worth re-checking whenever a cap goes up.
+
+       New kinds arrive on a schedule so each one gets a wave or two to be
+       learned on its own before it becomes part of the mix. */
+    int chasers   = 2 + (n * 2) / 3;
+    int dashers   = (n >=  2) ? (n + 1) / 3   : 0;
+    int splitters = (n >=  3) ? n / 3         : 0;
+    int turrets   = (n >=  6) ? (n - 4) / 5   : 0;
+    int bombers   = (n >=  8) ? (n - 6) / 4   : 0;
+    /* THE LATE ROSTER STARTS AT 20, NOT IN THE TEENS. These three all punish a
+       build rather than a reflex - a shielder wants a way around it, a lobber
+       wants somewhere else to be, a rusher wants sustained thrust - and a run
+       that has not been handed its upgrades yet has none of those answers. Met
+       at wave 11 they were simply unfair; met at 20 they are the reason the
+       twenties stop being the same wave over and over.
+     *
+     * One wave apart so each still gets its own introduction, and the counts
+       start at one rather than ramping up from zero. */
+    int shielders = (n >= 20) ? 1 + (n - 20) / 6 : 0;
+    int lobbers   = (n >= 21) ? 1 + (n - 21) / 8 : 0;
+    int rushers   = (n >= 22) ? 1 + (n - 22) / 6 : 0;
+
+    int chaserCap = 10 + n / 8;  if (chaserCap > 20) chaserCap = 20;
+    int dashCap   =  3 + n / 14; if (dashCap   >  7) dashCap   = 7;
+    int splitCap  =  3 + n / 16; if (splitCap  >  6) splitCap  = 6;
+
+    if (chasers   > chaserCap) chasers   = chaserCap;
+    if (dashers   > dashCap)   dashers   = dashCap;
+    if (splitters > splitCap)  splitters = splitCap;
+    if (turrets   > 4)         turrets   = 4;
+    if (bombers   > 6)         bombers   = 6;
+    /* Three is a wall you have to fly around, four is a room you cannot shoot
+       into - and unlike the others these do not die to a stray shot, so the
+       cap has to be tighter than the arithmetic suggests. */
+    if (shielders > 3)         shielders = 3;
+    /* Two lobbers already means the arena has nowhere quiet in it; a third
+       would just be an unreadable carpet of blast rings. */
+    if (lobbers   > 2)         lobbers   = 2;
+    if (rushers   > 3)         rushers   = 3;
+
+    PushSpawn(EN_CHASER, chasers);
+    PushSpawn(EN_DASHER, dashers);
+    PushSpawn(EN_RUSHER, rushers);
+    PushSpawn(EN_SPLITTER, splitters);
+    PushSpawn(EN_TURRET, turrets);
+    PushSpawn(EN_BOMBER, bombers);
+    PushSpawn(EN_BOMBARDIER, lobbers);
+    PushSpawn(EN_SHIELDER, shielders);
+    ShuffleQueue();
+}
+
+static int LiveEnemies(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_ENEMIES; i++) if (enemies[i].active) n++;
+    return n;
+}
+
+static void UpdateSpawning(float dt)
+{
+    if (spawnIdx < spawnCount)
+    {
+        spawnTimer -= dt;
+        if (spawnTimer <= 0.0f)
+        {
+            EnemyType t = (EnemyType)spawnQueue[spawnIdx++];
+            Vector2 pos;
+            int     tier = 0;
+
+            if (t == EN_BOSS)
+            {
+                pos = (Vector2){ RandF(300.0f, SCREEN_W - 300.0f), GROUND_Y - 70.0f };
+                /* One kind per boss wave, cycling - wave 5 barrage, 10
+                   summoner, 15 charger, 20 vortex, 25 barrage again. */
+                tier = ((wave / 5) - 1) % BK_COUNT;
+                if (tier < 0) tier = 0;
+            }
+            /* A turret is an emplacement: it belongs on the floor, spread out,
+               never dropped into the middle of the air. */
+            else if (t == EN_TURRET)
+                pos = (Vector2){ RandF(120.0f, SCREEN_W - 120.0f), GROUND_Y - 30.0f };
+            else pos = RandomEdgeSpawn();
+
+            SpawnEnemy(t, pos, tier);
+
+            /* Early waves breathe. The first couple of minutes are for learning
+               to fly on recoil, not for dodging a crowd - so the gap between
+               spawns starts long and decays toward a constant stream. */
+            spawnTimer = 0.28f + 1.35f * powf(0.80f, (float)(wave - 1));
+        }
+    }
+    else if (LiveEnemies() == 0)
+    {
+        bool bossWave = (wave % 5 == 0);
+
+        /* the moment the last enemy dies */
+        if (!waveCleared)
+        {
+            waveCleared = true;
+            if (bossWave)
+            {
+                int before = player.hp;
+                player.hp += 2;
+                if (player.hp > PlayerMaxHp()) player.hp = PlayerMaxHp();
+                if (player.hp > before)
+                    AddPopupEx(player.pos, 0, TextFormat("체력 +%d", player.hp - before),
+                               (Color){ 120, 255, 170, 255 });
+
+                EmitBurst(player.pos, 0.0f, PI, 40, 60.0f, 320.0f, 0.9f, 5.0f,
+                          (Color){ 120, 255, 170, 255 }, 20.0f);
+                PlaySfx(&sfxWave, 0.8f);
+            }
+        }
+
+        intermission -= dt;
+        if (intermission <= 0.0f)
+        {
+            score += (long)(250.0f * wave * UpScoreMul() * (bossWave ? 3.0f : 1.0f));
+
+            /* Upgrades every other wave, and always after a boss. */
+            if (wave % 2 == 0 || bossWave)
+            {
+                RollUpgrades();
+                pendingPicks = bossWave ? 2 : 1;
+                upgradeT     = 0.0f;
+                state        = ST_UPGRADE;
+            }
+            else StartWave(wave + 1);
+        }
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Player                                                                     */
+/*----------------------------------------------------------------------------*/
+static void HurtPlayer(Vector2 from)
+{
+    if (player.invuln > 0.0f || !player.alive) return;
+
+    /* AEGIS: rolled fresh on every incoming hit. When it lands the hit simply
+       never happened - no health, no combo broken - and the short mercy window
+       stops a crowd from rolling against you several times in one frame. */
+    if (RollChance(AegisChance()))
+    {
+        player.shieldFlash = 0.35f;
+        player.invuln      = 0.35f;
+
+        Vector2 push = Vector2Subtract(player.pos, from);
+        if (Vector2LengthSqr(push) < 0.001f) push = (Vector2){ 0, -1 };
+        player.vel = Vector2Add(player.vel,
+                                Vector2Scale(Vector2Normalize(push), 240.0f));
+
+        AddShock(player.pos, PLAYER_RADIUS + 22.0f, (Color){ 120, 210, 255, 255 });
+        EmitBurst(player.pos, 0.0f, PI, 22, 90.0f, 300.0f, 0.4f, 4.0f,
+                  (Color){ 120, 210, 255, 255 }, 40.0f);
+        AddPopupEx(player.pos, 0, "무력화!", (Color){ 120, 210, 255, 255 });
+        AddShake(6.0f);
+        PlaySfx(&sfxReload, 0.55f);
+        return;
+    }
+
+    player.hp--;
+    player.invuln = 1.3f;
+    player.combo  = 0;
+
+    Vector2 push = Vector2Subtract(player.pos, from);
+    if (Vector2LengthSqr(push) < 0.001f) push = (Vector2){ 0, -1 };
+    player.vel = Vector2Add(player.vel, Vector2Scale(Vector2Normalize(push), 320.0f));
+
+    AddShake(12.0f);
+    flashWhite = 0.35f;
+    PlaySfx(&sfxHurt, 1.0f);
+    EmitBurst(player.pos, 0.0f, PI, 24, 80.0f, 320.0f, 0.5f, 4.0f,
+              (Color){ 255, 90, 90, 255 }, 200.0f);
+
+    /* THORNS: punish whatever just touched you */
+    if (upStacks[UP_THORNS] > 0)
+    {
+        float radius = 90.0f + 30.0f * upStacks[UP_THORNS];
+        float dmg    = 2.0f * upStacks[UP_THORNS];
+
+        for (int i = 0; i < MAX_ENEMIES; i++)
+        {
+            Enemy *e = &enemies[i];
+            if (!e->active || e->spawnT > 0.0f) continue;
+            if (Vector2Distance(e->pos, player.pos) > radius + e->radius) continue;
+            DamageEnemy(e, dmg, player.pos);
+        }
+        AddShock(player.pos, radius, (Color){ 255, 160, 220, 255 });
+        EmitBurst(player.pos, 0.0f, PI, 30, 120.0f, radius * 3.5f, 0.45f, 5.0f,
+                  (Color){ 255, 160, 220, 255 }, 30.0f);
+
+        /* ...and sometimes the blast gives the point back. Guarded on hp > 0
+           so it can heal a wound but never undo a death. */
+        if (player.hp > 0 && player.hp < PlayerMaxHp() && RollChance(ThornsHealChance()))
+        {
+            player.hp++;
+            AddPopupEx(player.pos, 0, "체력 +1", (Color){ 255, 160, 220, 255 });
+            PlaySfx(&sfxReload, 1.5f);
+        }
+    }
+
+    if (player.hp <= 0)
+    {
+        player.alive  = false;
+        player.deathT = 0.0f;
+        AddShake(24.0f);
+        flashWhite = 0.7f;
+        PlaySfx(&sfxBoom, 0.8f);
+        EmitBurst(player.pos, 0.0f, PI, 70, 60.0f, 560.0f, 0.9f, 5.0f,
+                  (Color){ 120, 230, 255, 255 }, 300.0f);
+    }
+}
+
+/* 0 while the floor is safe, ramping to 1 at the moment it erupts.
+   Deliberately reads the gauge alone rather than also demanding `grounded`:
+   heat now builds while skimming, and a warning you cannot see while it is
+   filling would be worse than no warning at all. */
+static float GroundDanger(void)
+{
+    float total = UpGroundTime();
+    float warn  = total * 0.5f;
+    if (player.groundT <= warn) return 0.0f;
+    return Clamp((player.groundT - warn) / (total - warn), 0.0f, 1.0f);
+}
+
+/* The floor is a pit stop, not a home. Stand too long and it throws you off. */
+static void GroundErupt(void)
+{
+    Vector2 base = { player.pos.x, (float)GROUND_Y };
+
+    EmitBurst(base, -PI / 2.0f, 0.45f, 44, 220.0f, 760.0f, 0.7f, 6.0f,
+              (Color){ 255, 150, 50, 255 }, 520.0f);
+    EmitBurst(base, -PI / 2.0f, 1.3f, 22, 80.0f, 320.0f, 0.5f, 5.0f,
+              (Color){ 255, 235, 160, 255 }, 420.0f);
+
+    AddShake(15.0f);
+    flashWhite = 0.3f;
+    PlaySfx(&sfxBoom, 1.35f);
+
+    HurtPlayer(base);               /* damage still respects invulnerability... */
+    player.vel.y    = -620.0f;      /* ...but the launch always happens */
+    player.grounded = false;
+    player.groundT  = 0.0f;
+}
+
+static void FirePlayer(Vector2 target)
+{
+    Vector2 dir = Vector2Subtract(target, player.pos);
+    if (Vector2LengthSqr(dir) < 1.0f) dir = (Vector2){ 1, 0 };
+    dir = Vector2Normalize(dir);
+
+    const WeaponDef *w = &WEAPONS[player.weapon];
+
+    float   aimA    = atan2f(dir.y, dir.x);
+    Vector2 shotDir = FromAngle(aimA, 1.0f);
+    Vector2 muzzle  = Vector2Add(player.pos, Vector2Scale(shotDir, PLAYER_RADIUS + 8.0f));
+
+    /* SCATTER adds shots to whatever the weapon already fires, and widens the
+       cone with them - piling extra pellets into the same narrow angle would
+       just be a damage multiplier wearing a shotgun costume. */
+    int   pellets = w->pellets + upStacks[UP_SCATTER];
+    float spread  = w->spread + 0.075f * upStacks[UP_SCATTER];
+
+    /* Pellets are fanned evenly across the cone rather than each one rolling
+       its own angle. Independent rolls clump toward the middle, which is why a
+       random shotgun reads as a slightly wider pistol; a fan actually spreads.
+       The jitter is only there to keep the pattern from looking stamped. */
+    for (int i = 0; i < pellets; i++)
+    {
+        float t = (pellets > 1) ? ((float)i / (float)(pellets - 1)) * 2.0f - 1.0f
+                                : 0.0f;
+        float a = aimA + spread * t + RandF(-spread, spread) * 0.16f;
+
+        /* The whole game in two lines: shots go forward, you go backward. */
+        if (w->hitscan) FireBeam(muzzle, FromAngle(a, 1.0f), w);
+        else SpawnPlayerShot(muzzle,
+                             Vector2Scale(FromAngle(a, 1.0f),
+                                          w->bulletSpeed * UpSpeedMul()
+                                                         * RandF(0.92f, 1.08f)), w);
+    }
+
+    player.vel = Vector2Add(player.vel,
+                            Vector2Scale(shotDir,
+                                         -tune.recoilImpulse * w->recoilMul * UpRecoilMul()));
+
+    /* BACKBLAST: the recoil itself hurts whatever is behind you, which is
+       exactly where you are about to fly away from. */
+    if (upStacks[UP_BACKBLAST] > 0)
+    {
+        float   radius = BackblastRadius(w);
+        float   dmg    = 0.6f * upStacks[UP_BACKBLAST] * w->recoilMul;
+        Vector2 at     = Vector2Add(player.pos, Vector2Scale(shotDir, -PLAYER_RADIUS));
+
+        for (int i = 0; i < MAX_ENEMIES; i++)
+        {
+            Enemy *e = &enemies[i];
+            if (!e->active || e->spawnT > 0.0f) continue;
+            if (Vector2Distance(e->pos, at) > radius + e->radius) continue;
+            DamageEnemy(e, dmg, at);
+        }
+
+        /* The ring is how the player learns the range, but an SMG would strobe
+           it - so the damage is every shot and the ring is not. */
+        if (player.blastT <= 0.0f)
+        {
+            AddShock(at, radius, (Color){ 180, 160, 255, 255 });
+            player.blastT = 0.16f;
+        }
+    }
+
+    player.cooldown = tune.fireCooldown * w->cooldownMul * UpFireMul();
+    player.muzzle   = 0.07f;
+    player.grounded = false;
+
+    if (w->slash)   /* mirror each swing so repeated slashes read as a combo */
+    {
+        player.swingT    = SWORD_SWING;
+        player.swingSide = -player.swingSide;
+    }
+
+    float back = aimA + PI;
+    EmitBurst(muzzle, aimA, 0.35f + w->spread, 6 + w->pellets, 120.0f, 420.0f,
+              0.28f, 4.0f, (Color){ 255, 220, 150, 255 }, 120.0f);
+    EmitBurst(player.pos, back, 0.7f, 9, 40.0f, 190.0f * w->recoilMul, 0.5f, 6.0f,
+              (Color){ 150, 150, 170, 255 }, -30.0f);
+
+    AddShake(3.0f * w->recoilMul);
+    PlaySfx(&sfxShoot, RandF(0.92f, 1.10f) / w->recoilMul);
+}
+
+static void UpdatePlayer(float dt)
+{
+    if (!player.alive)
+    {
+        player.deathT += dt;
+        return;
+    }
+
+    Vector2 mouse = VirtualMouse();
+    Vector2 aimV  = Vector2Subtract(mouse, player.pos);
+    if (Vector2LengthSqr(aimV) > 1.0f) player.aim = atan2f(aimV.y, aimV.x);
+
+    if (player.cooldown > 0.0f) player.cooldown -= dt;
+    if (player.invuln   > 0.0f) player.invuln   -= dt;
+    if (player.muzzle   > 0.0f) player.muzzle   -= dt;
+    if (player.swingT   > 0.0f) player.swingT   -= dt;
+    if (player.shieldFlash > 0.0f) player.shieldFlash -= dt;
+    if (player.blastT   > 0.0f) player.blastT   -= dt;
+    if (player.comboFlash > 0.0f) player.comboFlash -= dt;
+
+    player.blinkTimer -= dt;
+    if (player.blinkTimer < -0.12f) player.blinkTimer = RandF(2.0f, 5.0f);
+
+    /* Ammo is infinite - the fire interval alone rations how much you can fly. */
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && player.cooldown <= 0.0f)
+        FirePlayer(mouse);
+
+    /* Integration */
+    player.vel.y += tune.gravity * dt;
+    player.vel = Vector2Scale(player.vel, powf(tune.airDrag, dt * 60.0f));
+    player.pos = Vector2Add(player.pos, Vector2Scale(player.vel, dt));
+
+    /* Arena collision - walls bounce, which is what makes trick shots exist. */
+    bool wasGrounded = player.grounded;
+    player.grounded = false;
+
+    if (player.pos.x < PLAYER_RADIUS)
+    {
+        player.pos.x = PLAYER_RADIUS;
+        if (player.vel.x < -60.0f)
+        {
+            EmitBurst(player.pos, 0.0f, 1.0f, 6, 60.0f, 200.0f, 0.3f, 3.0f, GRAY, 200.0f);
+            AddShake(2.0f);
+        }
+        player.vel.x = -player.vel.x * 0.5f;
+    }
+    if (player.pos.x > SCREEN_W - PLAYER_RADIUS)
+    {
+        player.pos.x = SCREEN_W - PLAYER_RADIUS;
+        if (player.vel.x > 60.0f)
+        {
+            EmitBurst(player.pos, PI, 1.0f, 6, 60.0f, 200.0f, 0.3f, 3.0f, GRAY, 200.0f);
+            AddShake(2.0f);
+        }
+        player.vel.x = -player.vel.x * 0.5f;
+    }
+    if (player.pos.y < PLAYER_RADIUS)
+    {
+        player.pos.y = PLAYER_RADIUS;
+        player.vel.y = -player.vel.y * 0.5f;
+    }
+    if (player.pos.y > GROUND_Y - PLAYER_RADIUS)
+    {
+        player.pos.y = GROUND_Y - PLAYER_RADIUS;
+        if (player.vel.y > 260.0f)
+        {
+            EmitBurst((Vector2){ player.pos.x, GROUND_Y }, -PI / 2, 1.1f, 10,
+                      80.0f, 260.0f, 0.35f, 4.0f, (Color){ 120, 130, 150, 255 }, 400.0f);
+            AddShake(fminf(6.0f, player.vel.y * 0.012f));
+        }
+        player.vel.y = -player.vel.y * 0.22f;
+        player.vel.x *= 0.86f;
+        if (fabsf(player.vel.y) < 90.0f)
+        {
+            player.vel.y    = 0.0f;
+            player.grounded = true;
+        }
+    }
+
+    if (player.grounded)
+    {
+        player.airTime = 0.0f;
+        if (!wasGrounded && player.combo > 0) player.combo = 0;   /* touching down burns the combo */
+    }
+    else player.airTime += dt;
+
+    /* Floor heat.
+     *
+     * This used to be a plain stopwatch that ran while grounded and snapped to
+     * zero the instant you were not - which made the floor the safest place in
+     * the game. Lifting a few pixels wiped the whole timer, so you could skim
+     * the ground indefinitely and never pay for it, and the escape hatch cost
+     * one downward shot.
+     *
+     * Now it is a gauge. It fills anywhere in the low band (fastest while
+     * actually standing, slower while skimming just above it) and only drains
+     * once you are properly airborne - and drains slower than it fills, so a
+     * hop buys a little relief but never a reset. Living on the floor is
+     * finally a decision with a cost. */
+    {
+        float total = UpGroundTime();
+        float prev  = player.groundT;
+
+        if (player.grounded)
+            player.groundT += dt;
+        else if (player.pos.y > GROUND_Y - GROUND_HEAT_BAND)
+            player.groundT += dt * GROUND_SKIM_RATE;
+        else
+        {
+            player.groundT -= dt * GROUND_COOL_RATE;
+            if (player.groundT < 0.0f) player.groundT = 0.0f;
+        }
+
+        if (prev <= total * 0.5f && player.groundT > total * 0.5f) PlaySfx(&sfxWarn, 1.0f);
+        if (player.groundT >= total) GroundErupt();
+    }
+
+    /* speed trail */
+    if (Vector2Length(player.vel) > 420.0f && GetRandomValue(0, 1) == 0)
+        EmitBurst(player.pos, 0.0f, PI, 1, 0.0f, 25.0f, 0.28f, 5.0f,
+                  (Color){ 90, 200, 255, 255 }, 0.0f);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Enemy behaviour                                                            */
+/*----------------------------------------------------------------------------*/
+static void UpdateEnemies(float dt)
+{
+    for (int i = 0; i < MAX_ENEMIES; i++)
+    {
+        Enemy *e = &enemies[i];
+        if (!e->active) continue;
+
+        e->rot += e->rotSpeed * dt;
+        if (e->hitFlash > 0.0f) e->hitFlash -= dt;
+
+        if (e->spawnT > 0.0f)
+        {
+            e->spawnT -= dt;
+            continue;
+        }
+
+        Vector2 toPlayer = Vector2Subtract(player.pos, e->pos);
+        float   dist     = Vector2Length(toPlayer);
+        Vector2 dir      = (dist > 0.001f) ? Vector2Scale(toPlayer, 1.0f / dist)
+                                           : (Vector2){ 0, 0 };
+
+        switch (e->type)
+        {
+            case EN_CHASER:
+            {
+                /* Aim where the player is going, not where they are - otherwise
+                   simply drifting sideways dodges every chaser for free. */
+                Vector2 lead  = Vector2Add(player.pos, Vector2Scale(player.vel, 0.22f));
+                Vector2 ldir  = Vector2Normalize(Vector2Subtract(lead, e->pos));
+                float   speed = fminf(340.0f, 145.0f + wave * 12.0f);
+
+                /* The cap is reached at wave 16, and from there the basic enemy
+                   stopped changing at all. A small amount of extra closing
+                   speed past that point is worth more than the same difficulty
+                   spent on health - a faster chaser is a shorter reaction
+                   window, a tougher one is just a longer trigger pull. */
+                if (wave > 16) speed = fminf(400.0f, speed + (wave - 16) * 2.5f);
+
+                e->vel = Vector2Add(e->vel, Vector2Scale(ldir, 1000.0f * dt));
+                if (Vector2Length(e->vel) > speed)
+                    e->vel = Vector2Scale(Vector2Normalize(e->vel), speed);
+            } break;
+
+            case EN_SPLITTER:
+            {
+                e->timer2 += dt * 2.0f;
+                float speed = (e->tier == 0) ? 70.0f : 130.0f;
+                Vector2 drift = { cosf(e->timer2) * 60.0f, sinf(e->timer2 * 1.3f) * 40.0f };
+                Vector2 want  = Vector2Add(Vector2Scale(dir, speed), drift);
+                e->vel = Vector2Lerp(e->vel, want, 1.0f - powf(0.02f, dt));
+            } break;
+
+            case EN_DASHER:
+            {
+                /* Commits to a direction, shows it, then charges. It threatens
+                   space instead of shooting, so you dodge with movement rather
+                   than by out-aiming a projectile. */
+                e->timer -= dt;
+                switch (e->phase)
+                {
+                    case 0:     /* close in until it is worth charging */
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 115.0f),
+                                             1.0f - powf(0.05f, dt));
+                        if (dist < 300.0f)
+                        {
+                            e->phase = 1;
+                            e->timer = DASH_WINDUP;
+                            e->lockDir = dir;      /* committed - you can dodge it */
+                            PlaySfx(&sfxWarn, 1.5f);
+                        }
+                        break;
+
+                    case 1:     /* wind-up: brakes hard and telegraphs the lane */
+                        e->vel = Vector2Scale(e->vel, powf(0.02f, dt));
+                        if (e->timer <= 0.0f)
+                        {
+                            e->phase = 2;
+                            e->timer = DASH_TIME;
+                            e->vel   = Vector2Scale(e->lockDir, DASH_SPEED);
+                            EmitBurst(e->pos, atan2f(-e->lockDir.y, -e->lockDir.x), 0.6f,
+                                      12, 90.0f, 300.0f, 0.35f, 4.0f, EnemyColor(e), 120.0f);
+                            PlaySfx(&sfxShoot, 0.5f);
+                        }
+                        break;
+
+                    case 2:     /* the charge itself, overshooting past the player */
+                        if (GetRandomValue(0, 1) == 0)
+                            EmitBurst(e->pos, 0.0f, PI, 1, 0.0f, 40.0f, 0.3f, 4.0f,
+                                      EnemyColor(e), 0.0f);
+                        if (e->timer <= 0.0f) { e->phase = 3; e->timer = DASH_RECOVER; }
+                        break;
+
+                    default:    /* recovery: slow and open to punishment */
+                        e->vel = Vector2Scale(e->vel, powf(0.08f, dt));
+                        if (e->timer <= 0.0f) e->phase = 0;
+                        break;
+                }
+            } break;
+
+            /* Locks on, charges, and does it three times without letting go.
+               The lock TRACKS you while it winds up - unlike the dasher, whose
+               lane is fixed the moment it commits - so the dodge has to come
+               late. Between dashes it re-locks in a third of the time, which is
+               where the pressure is: you get one beat to have already moved. */
+            case EN_RUSHER:
+            {
+                e->timer -= dt;
+                switch (e->phase)
+                {
+                    case 0:     /* close to a range worth charging from */
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 130.0f),
+                                             1.0f - powf(0.06f, dt));
+                        if (dist < 420.0f && e->timer <= 0.0f)
+                        {
+                            e->phase   = 1;
+                            e->timer   = RUSH_LOCK;
+                            e->gen     = RUSH_DASHES;
+                            e->lockDir = dir;
+                            PlaySfx(&sfxWarn, 1.1f);
+                        }
+                        break;
+
+                    case 1:     /* lock-on: still aiming, nearly stationary */
+                        e->vel     = Vector2Scale(e->vel, powf(0.05f, dt));
+                        e->lockDir = Vector2Lerp(e->lockDir, dir,
+                                                 1.0f - powf(0.02f, dt));
+                        if (Vector2LengthSqr(e->lockDir) > 0.0001f)
+                            e->lockDir = Vector2Normalize(e->lockDir);
+
+                        if (e->timer <= 0.0f)
+                        {
+                            e->phase = 2;
+                            e->timer = RUSH_TIME;
+                            e->vel   = Vector2Scale(e->lockDir, RUSH_SPEED);
+                            EmitBurst(e->pos, atan2f(-e->lockDir.y, -e->lockDir.x), 0.6f,
+                                      14, 100.0f, 340.0f, 0.35f, 4.5f, EnemyColor(e), 130.0f);
+                            AddShake(3.0f);
+                            PlaySfx(&sfxShoot, 0.45f);
+                        }
+                        break;
+
+                    case 2:     /* the dash - straight, committed, fast */
+                        EmitBurst(e->pos, 0.0f, PI, 1, 0.0f, 60.0f, 0.3f, 4.0f,
+                                  EnemyColor(e), 0.0f);
+                        if (e->timer <= 0.0f)
+                        {
+                            /* Out of dashes it has to rest, and that rest is
+                               the whole window you get to kill it in. */
+                            if (--e->gen > 0) { e->phase = 1; e->timer = RUSH_RELOCK; }
+                            else              { e->phase = 3; e->timer = 1.15f;       }
+                        }
+                        break;
+
+                    default:    /* spent */
+                        e->vel = Vector2Scale(e->vel, powf(0.06f, dt));
+                        if (e->timer <= 0.0f) { e->phase = 0; e->timer = 0.5f; }
+                        break;
+                }
+            } break;
+
+            /* Hangs back and lobs. It is the only enemy that makes a PLACE
+               dangerous rather than a line or a body, so the answer is to stop
+               hovering - or to close the distance it is trying to keep. */
+            case EN_BOMBARDIER:
+            {
+                /* Backs off when you come at it, drifts closer when you are far,
+                   and always sways - a stationary lobber is free target practice. */
+                e->timer2 += dt;
+                float want  = (dist < 300.0f) ? -150.0f : ((dist > 460.0f) ? 110.0f : 0.0f);
+                Vector2 sway = { cosf(e->timer2 * 1.6f) * 55.0f,
+                                 sinf(e->timer2 * 2.1f) * 45.0f };
+
+                e->vel = Vector2Lerp(e->vel,
+                                     Vector2Add(Vector2Scale(dir, want), sway),
+                                     1.0f - powf(0.08f, dt));
+
+                e->timer -= dt;
+                if (e->timer <= 0.0f)
+                {
+                    float gap = 2.9f - wave * 0.04f;
+                    e->timer  = (gap < 1.5f) ? 1.5f : gap;
+
+                    ThrowBombAt(Vector2Add(e->pos, (Vector2){ 0.0f, -e->radius }),
+                                player.pos, (Color){ 210, 235, 110, 255 });
+                    EmitBurst(e->pos, -PI / 2.0f, 0.7f, 5, 40.0f, 130.0f, 0.3f, 3.0f,
+                              EnemyColor(e), 90.0f);
+                    PlaySfx(&sfxShoot, 0.9f);
+                }
+            } break;
+
+            /* Fixed gun. Never moves, never closes - it just makes one lane of
+               the arena expensive and dares you to keep flying through it. */
+            case EN_TURRET:
+            {
+                e->vel = Vector2Scale(e->vel, powf(0.02f, dt));  /* plants itself */
+
+                e->timer -= dt;
+                if (e->timer <= 0.0f)
+                {
+                    float gap = 2.6f - wave * 0.05f;
+                    e->timer = (gap < 1.1f) ? 1.1f : gap;
+
+                    float base = atan2f(dir.y, dir.x);
+                    for (int k = -1; k <= 1; k++)
+                    {
+                        float a = base + k * 0.17f;
+                        SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius)),
+                                    FromAngle(a, 430.0f), 6.0f, 3.2f, false, 0,
+                                    (Color){ 255, 215, 90, 255 });
+                    }
+                    AddShake(2.0f);
+                    PlaySfx(&sfxShoot, 0.72f);
+                }
+            } break;
+
+            /* A walking wall. It has no gun and no reach worth speaking of -
+               what it does is make one direction of approach worthless, and
+               then walk that direction at you.
+             *
+             * The shield lags on purpose. Turning at SHIELD_TURN means it can
+             * always catch a player who hovers and trades, and can never catch
+             * one who commits to going around - which is the exact skill the
+             * recoil movement is for. */
+            case EN_SHIELDER:
+            {
+                if (e->guardT > 0.0f) e->guardT -= dt;
+
+                bool bare = (e->shield <= 0.0f);
+
+                /* Committed and winded both cost it the ability to keep up with
+                   you. That is the punish window: the bash is not just an
+                   attack to dodge, it is the moment its back becomes reachable
+                   for anyone who dodged sideways instead of backwards. */
+                float want = atan2f(dir.y, dir.x);
+                float turn = SHIELD_TURN * ((e->phase >= 2) ? 0.35f : 1.0f) * dt;
+                float diff = AngleDelta(want, e->timer2);
+                e->timer2 += (fabsf(diff) < turn) ? diff : ((diff > 0.0f) ? turn : -turn);
+
+                /* Facing is measured against the SHIELD, not the body: being in
+                   front is what makes the lunge fair. It only ever charges the
+                   side it can defend, so it cannot open with its back to you.
+                   Stripped of the plate it stops caring and comes at you from
+                   wherever it happens to be. */
+                bool infront = bare ||
+                               fabsf(AngleDelta(want, e->timer2)) < SHIELD_ARC;
+
+                e->timer -= dt;
+                switch (e->phase)
+                {
+                    case 0:     /* advance, slowly, like something heavy */
+                        e->vel = Vector2Lerp(e->vel,
+                                             Vector2Scale(dir, bare ? SHIELD_BROKEN_SPEED
+                                                                    : SHIELD_SPEED),
+                                             1.0f - powf(0.06f, dt));
+                        if (infront && dist < 260.0f && e->timer <= 0.0f)
+                        {
+                            e->phase   = 1;
+                            e->timer   = 0.55f;
+                            e->lockDir = dir;
+                            PlaySfx(&sfxWarn, 1.25f);
+                        }
+                        break;
+
+                    case 1:     /* plant the feet - the tell that it is coming */
+                        e->vel = Vector2Scale(e->vel, powf(0.03f, dt));
+                        if (e->timer <= 0.0f)
+                        {
+                            e->phase = 2;
+                            e->timer = 0.30f;
+                            e->vel   = Vector2Scale(e->lockDir, SHIELD_LUNGE);
+                            EmitBurst(e->pos, atan2f(e->lockDir.y, e->lockDir.x), 0.5f,
+                                      10, 80.0f, 260.0f, 0.3f, 4.0f, EnemyColor(e), 100.0f);
+                            PlaySfx(&sfxShoot, 0.65f);
+                        }
+                        break;
+
+                    case 2:     /* the bash itself - shield first, so still safe */
+                        if (e->timer <= 0.0f) { e->phase = 3; e->timer = 0.75f; }
+                        break;
+
+                    default:    /* winded, and the shield drifts - go around now */
+                        e->vel = Vector2Scale(e->vel, powf(0.05f, dt));
+                        if (e->timer <= 0.0f) { e->phase = 0; e->timer = 1.4f; }
+                        break;
+                }
+            } break;
+
+            /* Walks it in. The threat is not the contact, it is the crater. */
+            case EN_BOMBER:
+            {
+                e->timer += dt;      /* drives the fuse blink in DrawEnemy */
+                Vector2 want = Vector2Scale(dir, fminf(190.0f, 90.0f + wave * 6.0f));
+                e->vel = Vector2Lerp(e->vel, want, 1.0f - powf(0.08f, dt));
+            } break;
+
+            case EN_BOSS:
+            {
+                switch (e->tier)
+                {
+                    /* Ring barrage: fills the room and forces you to keep
+                       flying rather than hover and trade. */
+                    case BK_BARRAGE:
+                    default:
+                    {
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 80.0f),
+                                             1.0f - powf(0.2f, dt));
+
+                        e->timer -= dt;
+                        if (e->timer <= 0.0f)
+                        {
+                            e->timer = 2.4f;
+                            int   n    = 14;
+                            float base = RandF(0.0f, 2.0f * PI);
+                            for (int k = 0; k < n; k++)
+                            {
+                                float a = base + (2.0f * PI * k) / n;
+                                SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius)),
+                                            FromAngle(a, 260.0f), 6.0f, 4.0f, false, 0,
+                                            (Color){ 255, 110, 190, 255 });
+                            }
+                            AddShake(6.0f);
+                            PlaySfx(&sfxShoot, 0.45f);
+                        }
+
+                        /* Adds are seasoning, not the meal - the barrage is what
+                           this fight is about, and a stream of chasers on top of
+                           it just buries the pattern you are supposed to read. */
+                        e->timer2 -= dt;
+                        if (e->timer2 <= 0.0f)
+                        {
+                            e->timer2 = 10.0f;
+                            SpawnEnemy(EN_CHASER,
+                                       Vector2Add(e->pos, (Vector2){ RandF(-60, 60), 60 }), 0);
+                        }
+                    } break;
+
+                    /* Summoner: keeps its distance and buries you in adds, so
+                       the real question is whether you can reach it at all. */
+                    case BK_SUMMONER:
+                    {
+                        /* Generation decides the whole personality here. The
+                           original keeps its distance and hides behind adds;
+                           everything it breaks into has no guns left and comes
+                           straight at you like oversized splitters, faster the
+                           smaller it gets. Seven-plus shooters would be an
+                           unreadable bullet storm, so the gate is gen 0 only -
+                           it does not loosen as the split count grows. */
+                        float want = (e->gen > 0)
+                                         ? 200.0f + 60.0f * e->gen
+                                         : ((dist < 320.0f) ? -110.0f : 55.0f);
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, want),
+                                             1.0f - powf(0.25f, dt));
+
+                        e->timer -= dt;
+                        if (e->timer <= 0.0f && e->gen == 0)
+                        {
+                            e->timer = 1.7f;
+
+                            int   fan  = 2;      /* 5 shots - only gen 0 fires */
+                            float base = atan2f(dir.y, dir.x);
+                            for (int k = -fan; k <= fan; k++)
+                                SpawnBullet(Vector2Add(e->pos, FromAngle(base + k * 0.20f, e->radius)),
+                                            FromAngle(base + k * 0.20f, 300.0f), 6.0f, 3.5f, false, 0,
+                                            (Color){ 200, 140, 255, 255 });
+                            PlaySfx(&sfxShoot, 0.55f);
+                        }
+
+                        /* Only the original summons - the halves doing it as
+                           well would bury the arena the moment it broke apart. */
+                        e->timer2 -= dt;
+                        if (e->timer2 <= 0.0f && e->gen == 0)
+                        {
+                            /* One add per call instead of two, and less often.
+                               The splitting fight already supplies plenty of
+                               bodies on its own once it starts coming apart. */
+                            e->timer2 = 5.5f;
+                            Vector2 at = Vector2Add(e->pos, (Vector2){ RandF(-80, 80), 70 });
+                            SpawnEnemy((GetRandomValue(0, 2) == 0) ? EN_SPLITTER : EN_DASHER,
+                                       at, 0);
+                            PlaySfx(&sfxWarn, 1.1f);
+                        }
+                    } break;
+
+                    /* Vortex: the only boss that attacks your MOVEMENT. It drags
+                       you toward itself continuously, which turns the core loop
+                       inside out - shooting at it shoves you away from it, so
+                       the pull and your own gun are pushing you in opposite
+                       directions and you have to pick one. Firing away from it
+                       is now how you close the distance.
+                     *
+                     * Nothing here has a safe hovering answer, which is why it
+                       carries the least health of the four. */
+                    case BK_VORTEX:
+                    {
+                        /* Drifts, rather than chases - it does not need to
+                           close, the arena comes to it. */
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 34.0f),
+                                             1.0f - powf(0.4f, dt));
+
+                        e->timer  -= dt;
+                        e->timer2 -= dt;
+
+                        if (e->phase == 0)
+                        {
+                            /* The pull. Eased off inside 130px so point-blank
+                               is a place you can still fly out of, and capped
+                               by distance so the far side of the arena is not
+                               a free ride either. */
+                            if (player.alive)
+                            {
+                                float d    = fmaxf(dist, 1.0f);
+                                float grip = (d < 130.0f) ? (d / 130.0f) : 1.0f;
+                                player.vel = Vector2Subtract(
+                                    player.vel, Vector2Scale(dir, 480.0f * grip * dt));
+                            }
+
+                            /* A rotating spiral rather than the barrage boss's
+                               concentric rings: the gaps travel, so standing in
+                               one is temporary by construction. */
+                            if (e->timer <= 0.0f)
+                            {
+                                e->timer = 0.24f;
+                                e->rot  += 26.0f;   /* also spins the drawn body */
+
+                                float base = e->rot * DEG2RAD;
+                                for (int k = 0; k < 2; k++)
+                                {
+                                    float a = base + k * PI;
+                                    SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius)),
+                                                FromAngle(a, 235.0f), 6.0f, 5.0f, false, 0,
+                                                (Color){ 120, 240, 255, 255 });
+                                }
+                                PlaySfx(&sfxShoot, 1.25f);
+                            }
+
+                            if (e->timer2 <= 0.0f)      /* wind up the reversal */
+                            {
+                                e->phase  = 1;
+                                e->timer2 = 0.9f;
+                                PlaySfx(&sfxWarn, 0.6f);
+                            }
+                        }
+                        else
+                        {
+                            /* Wind-up: the pull nearly doubles, so the last
+                               second before the blast drags you INTO it. Then
+                               it reverses and flings you at a wall.
+                             *
+                               Same near-taper as the idle pull. Without it the
+                               wind-up would deliver you into the body and the
+                               contact damage would be scripted rather than
+                               something you flew into. */
+                            if (player.alive)
+                            {
+                                float d    = fmaxf(dist, 1.0f);
+                                float grip = (d < 130.0f) ? (d / 130.0f) : 1.0f;
+                                player.vel = Vector2Subtract(
+                                    player.vel, Vector2Scale(dir, 900.0f * grip * dt));
+                            }
+
+                            if (e->timer2 <= 0.0f)
+                            {
+                                e->phase  = 0;
+                                e->timer2 = RandF(4.5f, 6.0f);
+
+                                /* ...and now outward: `dir` points from the boss
+                                   to you, so this is the one place that ADDS
+                                   it. Closer means flung harder, which is what
+                                   makes the wind-up's extra pull a trap. */
+                                if (player.alive && dist < 460.0f)
+                                {
+                                    float k = 1.0f - dist / 460.0f;
+                                    player.vel = Vector2Add(
+                                        player.vel, Vector2Scale(dir, 900.0f * k));
+                                }
+
+                                /* The blast is push, not damage - being flung is
+                                   punishment enough, and the ring of shot it
+                                   leaves behind is what you actually dodge. */
+                                float base = RandF(0.0f, 2.0f * PI);
+                                for (int k = 0; k < 12; k++)
+                                {
+                                    float a = base + (2.0f * PI * k) / 12.0f;
+                                    SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius)),
+                                                FromAngle(a, 330.0f), 6.0f, 3.2f, false, 0,
+                                                (Color){ 160, 255, 255, 255 });
+                                }
+                                AddShock(e->pos, 240.0f, (Color){ 120, 240, 255, 255 });
+                                AddShake(9.0f);
+                                PlaySfx(&sfxBoom, 1.3f);
+                            }
+                        }
+                    } break;
+
+                    /* Bulwark: the shielder, boss-sized, with one change that
+                       makes it a fight instead of a chore - the plate SWEEPS at
+                       a fixed rate rather than tracking you. There is always an
+                       opening and it is always moving, so the fight is about
+                       orbiting against the rotation. Break the plate and it
+                       stops defending and starts firing in earnest. */
+                    case BK_BULWARK:
+                    {
+                        bool bare = (e->shield <= 0.0f);
+                        if (e->guardT > 0.0f) e->guardT -= dt;
+                        if (!bare) e->timer2 += 0.8f * dt;
+
+                        /* Holds the middle distance: close enough that going
+                           around it is a real trip, far enough that it is not
+                           simply a body-block. */
+                        float want = (dist < 250.0f) ? -70.0f : 75.0f;
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, want),
+                                             1.0f - powf(0.25f, dt));
+
+                        e->timer -= dt;
+                        if (e->timer <= 0.0f)
+                        {
+                            /* Guarded it fires a fan out of the shield face -
+                               the front is dangerous as well as useless. Bare
+                               it fires everywhere, faster: nothing left to hide
+                               behind, so it stops trying. */
+                            if (bare)
+                            {
+                                e->timer   = 1.5f;
+                                float base = RandF(0.0f, 2.0f * PI);
+                                for (int k = 0; k < 10; k++)
+                                {
+                                    float a = base + (2.0f * PI * k) / 10.0f;
+                                    SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius)),
+                                                FromAngle(a, 300.0f), 6.0f, 4.0f, false, 0,
+                                                (Color){ 200, 230, 255, 255 });
+                                }
+                                AddShake(6.0f);
+                            }
+                            else
+                            {
+                                e->timer = 2.3f;
+                                for (int k = -2; k <= 2; k++)
+                                {
+                                    float a = e->timer2 + k * 0.22f;
+                                    SpawnBullet(Vector2Add(e->pos, FromAngle(a, e->radius + 16.0f)),
+                                                FromAngle(a, 340.0f), 6.0f, 4.0f, false, 0,
+                                                (Color){ 200, 230, 255, 255 });
+                                }
+                                AddShake(4.0f);
+                            }
+                            PlaySfx(&sfxShoot, 0.6f);
+                        }
+                    } break;
+
+                    /* Lancer: the rusher grown up. Four tracking dashes in a
+                       row, and this one KEEPS ITS SPEED off the walls, so a
+                       missed dash comes back through the room instead of
+                       ending. The charger throws one lane at you; this fills
+                       the arena with itself and then stands still, exhausted,
+                       for a second and a half. */
+                    case BK_LANCER:
+                    {
+                        e->timer -= dt;
+                        switch (e->phase)
+                        {
+                            case 0:     /* stalk */
+                                e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 120.0f),
+                                                     1.0f - powf(0.1f, dt));
+                                if (e->timer <= 0.0f)
+                                {
+                                    e->phase   = 1;
+                                    e->timer   = 0.75f;
+                                    e->gen     = 4;         /* dashes in the chain */
+                                    e->lockDir = dir;
+                                    PlaySfx(&sfxWarn, 0.95f);
+                                }
+                                break;
+
+                            case 1:     /* lock-on, still tracking you */
+                                e->vel     = Vector2Scale(e->vel, powf(0.02f, dt));
+                                e->lockDir = Vector2Lerp(e->lockDir, dir,
+                                                         1.0f - powf(0.03f, dt));
+                                if (Vector2LengthSqr(e->lockDir) > 0.0001f)
+                                    e->lockDir = Vector2Normalize(e->lockDir);
+
+                                if (e->timer <= 0.0f)
+                                {
+                                    e->phase = 2;
+                                    e->timer = 0.55f;
+                                    e->vel   = Vector2Scale(e->lockDir, 1000.0f);
+                                    EmitBurst(e->pos,
+                                              atan2f(-e->lockDir.y, -e->lockDir.x), 0.7f,
+                                              18, 110.0f, 400.0f, 0.4f, 5.0f,
+                                              EnemyColor(e), 130.0f);
+                                    AddShake(7.0f);
+                                    PlaySfx(&sfxShoot, 0.4f);
+                                }
+                                break;
+
+                            case 2:     /* the dash, bouncing at full speed */
+                            {
+                                /* Reflected here rather than by the generic
+                                   arena clamp below, which damps to half speed
+                                   - that would turn a ricochet into a stumble.
+                                   Setting the velocity away from the wall also
+                                   stops the clamp from firing at all. */
+                                if ((e->pos.x < e->radius          && e->vel.x < 0.0f) ||
+                                    (e->pos.x > SCREEN_W - e->radius && e->vel.x > 0.0f))
+                                {
+                                    e->vel.x = -e->vel.x;
+                                    AddShake(4.0f);
+                                    EmitBurst(e->pos, 0.0f, PI, 8, 90.0f, 300.0f, 0.3f,
+                                              4.0f, EnemyColor(e), 120.0f);
+                                }
+                                if ((e->pos.y < e->radius          && e->vel.y < 0.0f) ||
+                                    (e->pos.y > GROUND_Y - e->radius && e->vel.y > 0.0f))
+                                {
+                                    e->vel.y = -e->vel.y;
+                                    AddShake(4.0f);
+                                    EmitBurst(e->pos, 0.0f, PI, 8, 90.0f, 300.0f, 0.3f,
+                                              4.0f, EnemyColor(e), 120.0f);
+                                }
+
+                                EmitBurst(e->pos, 0.0f, PI, 2, 0.0f, 80.0f, 0.35f, 5.0f,
+                                          EnemyColor(e), 0.0f);
+
+                                if (e->timer <= 0.0f)
+                                {
+                                    if (--e->gen > 0) { e->phase = 1; e->timer = 0.28f; }
+                                    else              { e->phase = 3; e->timer = 1.5f;  }
+                                }
+                            } break;
+
+                            default:    /* spent - the whole window to hurt it */
+                                e->vel = Vector2Scale(e->vel, powf(0.05f, dt));
+                                if (e->timer <= 0.0f) { e->phase = 0; e->timer = 1.1f; }
+                                break;
+                        }
+                    } break;
+
+                    /* Mortar: the bombardier at siege scale. It never comes to
+                       you - it takes the floor away instead, first in salvos
+                       aimed where you are standing, then in a carpet that walks
+                       across the whole arena toward you. The only boss you
+                       fight by choosing where to be rather than what to dodge. */
+                    case BK_MORTAR:
+                    {
+                        Color bomb = (Color){ 225, 245, 120, 255 };
+
+                        /* Keeps its distance and keeps its altitude. */
+                        float want = (dist < 400.0f) ? -130.0f : 45.0f;
+                        e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, want),
+                                             1.0f - powf(0.2f, dt));
+                        if (e->pos.y > GROUND_Y - 260.0f) e->vel.y -= 190.0f * dt;
+
+                        e->timer -= dt;
+
+                        if (e->phase == 0)          /* aimed salvos */
+                        {
+                            e->timer2 -= dt;
+
+                            if (e->timer <= 0.0f)
+                            {
+                                e->timer = 2.5f;
+
+                                /* Three charges: one on you, two bracketing -
+                                   so the dodge cannot simply be "step aside". */
+                                Vector2 muzzle = Vector2Add(e->pos, (Vector2){ 0.0f, -e->radius });
+                                for (int k = -1; k <= 1; k++)
+                                {
+                                    Vector2 at = { player.pos.x + k * 130.0f, player.pos.y };
+                                    ThrowBombAt(muzzle, at, bomb);
+                                }
+                                PlaySfx(&sfxShoot, 0.85f);
+                            }
+
+                            if (e->timer2 <= 0.0f)  /* time to walk the carpet */
+                            {
+                                e->phase  = 1;
+                                e->timer  = 0.0f;
+                                /* Starts on the far side and sweeps TOWARD you,
+                                   so standing still is the one losing move. */
+                                e->gen    = (player.pos.x < SCREEN_W * 0.5f) ? 9 : 0;
+                                e->lockDir = (Vector2){ (e->gen == 0) ? 1.0f : -1.0f, 0.0f };
+                                PlaySfx(&sfxWarn, 0.55f);
+                            }
+                        }
+                        else                        /* the carpet itself */
+                        {
+                            if (e->timer <= 0.0f)
+                            {
+                                e->timer = 0.2f;
+
+                                float x  = 110.0f + e->gen * ((SCREEN_W - 220.0f) / 9.0f);
+                                Vector2 muzzle = Vector2Add(e->pos, (Vector2){ 0.0f, -e->radius });
+                                ThrowBombAt(muzzle, (Vector2){ x, GROUND_Y - 24.0f }, bomb);
+
+                                e->gen += (e->lockDir.x > 0.0f) ? 1 : -1;
+                                if (e->gen < 0 || e->gen > 9)
+                                {
+                                    e->phase  = 0;
+                                    e->timer  = 1.6f;
+                                    e->timer2 = RandF(9.0f, 12.0f);
+                                }
+                            }
+                        }
+                    } break;
+
+                    /* Charger: no bullets at all. It winds up, telegraphs, and
+                       throws its whole mass down the lane you are standing in. */
+                    case BK_CHARGER:
+                    {
+                        e->timer -= dt;
+                        switch (e->phase)
+                        {
+                            case 0:     /* stalk */
+                                e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 150.0f),
+                                                     1.0f - powf(0.1f, dt));
+                                if (e->timer <= 0.0f)
+                                {
+                                    e->phase   = 1;
+                                    e->timer   = 0.85f;
+                                    e->lockDir = dir;
+                                    PlaySfx(&sfxWarn, 0.8f);
+                                }
+                                break;
+
+                            case 1:     /* wind-up, lane shown in DrawEnemy */
+                                e->vel = Vector2Scale(e->vel, powf(0.02f, dt));
+                                if (e->timer <= 0.0f)
+                                {
+                                    e->phase = 2;
+                                    e->timer = 0.7f;
+                                    e->vel   = Vector2Scale(e->lockDir, 900.0f);
+                                    EmitBurst(e->pos,
+                                              atan2f(-e->lockDir.y, -e->lockDir.x), 0.7f,
+                                              22, 120.0f, 420.0f, 0.4f, 6.0f,
+                                              EnemyColor(e), 140.0f);
+                                    AddShake(8.0f);
+                                    PlaySfx(&sfxShoot, 0.35f);
+                                }
+                                break;
+
+                            case 2:     /* the charge */
+                                EmitBurst(e->pos, 0.0f, PI, 2, 0.0f, 70.0f, 0.35f, 5.0f,
+                                          EnemyColor(e), 0.0f);
+                                if (e->timer <= 0.0f) { e->phase = 3; e->timer = 1.0f; }
+                                break;
+
+                            default:    /* recovery - the window to punish it */
+                                e->vel = Vector2Scale(e->vel, powf(0.06f, dt));
+                                if (e->timer <= 0.0f) { e->phase = 0; e->timer = 1.3f; }
+                                break;
+                        }
+                    } break;
+                }
+            } break;
+        }
+
+        e->pos = Vector2Add(e->pos, Vector2Scale(e->vel, dt));
+
+        /* keep them inside the arena once they have entered it */
+        {
+            float r = e->radius;
+            if (e->pos.x < r && e->vel.x < 0 && e->pos.x > -r * 3) { e->pos.x = r; e->vel.x *= -0.5f; }
+            if (e->pos.x > SCREEN_W - r && e->vel.x > 0 && e->pos.x < SCREEN_W + r * 3)
+                { e->pos.x = SCREEN_W - r; e->vel.x *= -0.5f; }
+            if (e->pos.y > GROUND_Y - r) { e->pos.y = GROUND_Y - r; e->vel.y *= -0.4f; }
+            if (e->pos.y < r && e->vel.y < 0 && e->pos.y > -r * 3) { e->pos.y = r; e->vel.y *= -0.5f; }
+        }
+
+        /* contact damage */
+        if (player.alive && CheckCollisionCircles(e->pos, e->radius, player.pos, PLAYER_RADIUS))
+        {
+            /* A bomber that reaches you spends itself doing it - the blast is
+               the attack, so it never also lands a contact hit on top. */
+            if (e->type == EN_BOMBER) { KillEnemy(e, false); continue; }
+
+            HurtPlayer(e->pos);
+            if (e->type == EN_CHASER) DamageEnemy(e, 1.0f, player.pos);
+        }
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Bullet update                                                              */
+/*----------------------------------------------------------------------------*/
+/* Closest live enemy within range, or NULL. Used by homing shots. */
+static Enemy *NearestEnemy(Vector2 p, float maxDist)
+{
+    Enemy *best = NULL;
+    float  bestD = maxDist * maxDist;
+
+    for (int i = 0; i < MAX_ENEMIES; i++)
+    {
+        Enemy *e = &enemies[i];
+        if (!e->active || e->spawnT > 0.0f) continue;
+
+        float d = Vector2LengthSqr(Vector2Subtract(e->pos, p));
+        if (d < bestD) { bestD = d; best = e; }
+    }
+    return best;
+}
+
+static void UpdateBullets(float dt)
+{
+    for (int i = 0; i < MAX_BULLETS; i++)
+    {
+        Bullet *b = &bullets[i];
+        if (!b->active) continue;
+
+        b->life -= dt;
+        if (b->life <= 0.0f)
+        {
+            b->active = false;
+            /* Both sides have fuses now, and they are not the same explosion:
+               Explode hurts enemies and shoves the player, BomberBlast hurts
+               the player. Routing an enemy bomb through Explode would have it
+               damaging its own side and healing nobody. */
+            if (b->explosive)
+            {
+                if (b->fromPlayer) Explode(b->pos, b->damage, b->color);
+                else               BomberBlast(b->pos, BOMB_RADIUS);
+            }
+            continue;
+        }
+
+        /* HOMING bends the shot before it moves. A slash is a swing rather than
+           a projectile, so it keeps going wherever the swing went. */
+        if (b->fromPlayer && !b->slash && upStacks[UP_HOMING] > 0)
+        {
+            float  speed = Vector2Length(b->vel);
+            Enemy *t     = (speed > 1.0f) ? NearestEnemy(b->pos, 560.0f) : NULL;
+
+            if (t != NULL)
+            {
+                Vector2 cur  = Vector2Scale(b->vel, 1.0f / speed);
+                Vector2 want = Vector2Normalize(Vector2Subtract(t->pos, b->pos));
+                float   k    = 3.4f * upStacks[UP_HOMING] * dt;
+                if (k > 1.0f) k = 1.0f;
+
+                Vector2 mix = Vector2Lerp(cur, want, k);
+                if (Vector2LengthSqr(mix) > 0.0001f)
+                    b->vel = Vector2Scale(Vector2Normalize(mix), speed);
+            }
+        }
+
+        b->vel.y += b->grav * dt;
+
+        /* Where the shot was before this step. Collision is swept along that
+           segment rather than tested at the new point, because a point test
+           misses whatever is thinner than one frame of travel: a harpoon at
+           1350 covers 22px a frame and a chaser is only 15 across, so the
+           fastest gun in the game could already shoot straight through things.
+           The velocity upgrade would have made that the normal experience. */
+        Vector2 from = b->pos;
+        b->pos = Vector2Add(b->pos, Vector2Scale(b->vel, dt));
+
+        if (b->fromPlayer)
+        {
+            /* one wall bounce per bullet -> trick shots (rockets detonate instead) */
+            bool bounced = false;
+            if (b->pos.x < b->radius)              { b->pos.x = b->radius;              b->vel.x = -b->vel.x; bounced = true; }
+            if (b->pos.x > SCREEN_W - b->radius)   { b->pos.x = SCREEN_W - b->radius;   b->vel.x = -b->vel.x; bounced = true; }
+            if (b->pos.y < b->radius)              { b->pos.y = b->radius;              b->vel.y = -b->vel.y; bounced = true; }
+            if (b->pos.y > GROUND_Y - b->radius)   { b->pos.y = GROUND_Y - b->radius;   b->vel.y = -b->vel.y; bounced = true; }
+
+            if (bounced)
+            {
+                /* Out of bounces: a rocket detonates on the wall, everything
+                   else simply expires. Grenades keep their bounces and lose
+                   energy, so they settle into a lob rather than pinging away. */
+                if (b->bounces-- <= 0)
+                {
+                    b->active = false;
+                    if (b->explosive) Explode(b->pos, b->damage, b->color);
+                    continue;
+                }
+                if (b->grav > 0.0f) b->vel = Vector2Scale(b->vel, 0.62f);
+                EmitBurst(b->pos, 0.0f, PI, 4, 40.0f, 150.0f, 0.2f, 2.5f, b->color, 100.0f);
+
+                /* The path bent this frame, so the straight segment no longer
+                   describes where the shot went. Collapse the sweep to a point
+                   test rather than let it cut a corner it never travelled. */
+                from = b->pos;
+            }
+
+            if (b->explosive)     /* smoke trail so a slow rocket still reads fast */
+                EmitBurst(b->pos, 0.0f, PI, 1, 0.0f, 50.0f, 0.4f, 5.0f,
+                          (Color){ 190, 190, 200, 255 }, -20.0f);
+
+            for (int j = 0; j < MAX_ENEMIES; j++)
+            {
+                Enemy *e = &enemies[j];
+                if (!e->active || e->spawnT > 0.0f || j == b->lastHit) continue;
+                if (DistToSegment(e->pos, from, b->pos) > e->radius + b->radius) continue;
+
+                if (b->explosive)
+                {
+                    b->active = false;
+                    Explode(b->pos, b->damage, b->color);
+                    break;
+                }
+
+                /* Stopped dead by the shield, whatever it was carrying - a
+                   piercing shot does not get to spend a pierce and continue,
+                   or the enemy would be a speed bump for half the guns. */
+                if (ShieldBlocks(e, b->pos))
+                {
+                    ShieldHit(e, b->damage, b->pos, b->color);
+                    b->active = false;
+                    break;
+                }
+
+                DamageEnemy(e, b->damage, b->pos);
+
+                /* A piercing shot carries on, but remembers who it just went
+                   through so one pass can never land as two hits. */
+                if (b->pierce > 0) { b->pierce--; b->lastHit = j; }
+                else                 b->active = false;
+                break;
+            }
+        }
+        else
+        {
+            /* A thrown charge lands - it does not fall through the world and it
+               does not wait out its fuse in mid-air on the way down. Landing is
+               the common case, so this is where most of them go off. */
+            if (b->explosive && b->pos.y > GROUND_Y - b->radius)
+            {
+                b->active = false;
+                BomberBlast((Vector2){ b->pos.x, GROUND_Y - b->radius }, BOMB_RADIUS);
+                continue;
+            }
+
+            if (b->pos.x < -40 || b->pos.x > SCREEN_W + 40 ||
+                b->pos.y < -40 || b->pos.y > GROUND_Y + 40) { b->active = false; continue; }
+
+            if (player.alive &&
+                CheckCollisionCircles(b->pos, b->radius, player.pos, PLAYER_RADIUS))
+            {
+                b->active = false;
+                if (b->explosive) BomberBlast(b->pos, BOMB_RADIUS);
+                else              HurtPlayer(b->pos);
+            }
+        }
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Save file                                                                  */
+/*----------------------------------------------------------------------------*/
+static long LoadBest(void)
+{
+    if (!FileExists(SAVE_FILE)) return 0;
+
+    int size = 0;
+    unsigned char *data = LoadFileData(SAVE_FILE, &size);
+    long v = 0;
+    if (data)
+    {
+        if (size == (int)sizeof(long)) memcpy(&v, data, sizeof(long));
+        UnloadFileData(data);
+    }
+    if (v < 0) v = 0;
+    return v;
+}
+
+static void SaveBest(long v)
+{
+    SaveFileData(SAVE_FILE, &v, (int)sizeof(long));
+}
+
+/*----------------------------------------------------------------------------*/
+/* Game lifecycle                                                             */
+/*----------------------------------------------------------------------------*/
+static void ResetGame(void)
+{
+    memset(bullets,   0, sizeof(bullets));
+    memset(enemies,   0, sizeof(enemies));
+    memset(particles, 0, sizeof(particles));
+    memset(popups,    0, sizeof(popups));
+    memset(pickups, 0, sizeof(pickups));
+    memset(beams,   0, sizeof(beams));
+    memset(shocks,  0, sizeof(shocks));
+
+    /* upgrades are run-scoped: dying wipes the build, same as the weapon */
+    memset(upStacks, 0, sizeof(upStacks));
+    blastDepth   = 0;
+    pendingPicks = 0;
+    healSpawnT     = 0.0f;
+    weaponSpawnT   = 0.0f;
+    lastHealWave   = -1;
+    lastWeaponWave = -1;
+
+    memset(&player, 0, sizeof(player));
+    player.pos     = (Vector2){ SCREEN_W / 2.0f, GROUND_Y - 120.0f };
+    player.hp      = PlayerMaxHp();
+    player.alive   = true;
+    player.aim     = -PI / 2.0f;
+    player.weapon  = WP_PISTOL;     /* dying always costs you your weapon */
+    player.swingSide = 1;
+    aimCursor        = (Vector2){ SCREEN_W / 2.0f, SCREEN_H / 2.0f };
+
+    score        = 0;
+    runTime      = 0.0f;
+    newRecord    = false;
+    shake        = 0.0f;
+    hitstop      = 0.0f;
+    flashWhite   = 0.0f;
+    gameOverT    = 0.0f;
+    intermission = 1.2f;
+    spawnCount   = 0;
+    spawnIdx     = 0;
+
+    StartWave(1);
+}
+
+static void EndRun(void)
+{
+    state     = ST_GAMEOVER;
+    gameOverT = 0.0f;
+    score += (long)(runTime * 5.0f);
+    if (score > bestScore)
+    {
+        bestScore = score;
+        newRecord = true;
+        SaveBest(bestScore);
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Tuning panel                                                               */
+/*----------------------------------------------------------------------------*/
+static void InitParams(void)
+{
+    params[0] = (ParamRow){ "반동 세기",   &tune.recoilImpulse, 20.0f,  50.0f, 1500.0f, 0 };
+    params[1] = (ParamRow){ "중력",       &tune.gravity,       25.0f, 100.0f, 3000.0f, 0 };
+    params[2] = (ParamRow){ "공기저항",    &tune.airDrag,        0.002f, 0.90f,   1.0f, 3 };
+    params[3] = (ParamRow){ "연사 간격",   &tune.fireCooldown,   0.01f,  0.03f,  1.5f, 3 };
+    params[4] = (ParamRow){ "지면 허용",   &tune.groundTime,     0.10f,  0.40f,  8.0f, 2 };
+    params[5] = (ParamRow){ "마우스 감도", &tune.mouseSens,      0.10f,  0.20f,  8.0f, 2 };
+}
+
+static void UpdatePanel(void)
+{
+    if (IsKeyPressed(KEY_F1)) panelVisible = !panelVisible;
+    if (!panelVisible) return;
+
+    int count = PARAM_COUNT;
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) paramSel = (paramSel + 1) % count;
+    if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP))   paramSel = (paramSel + count - 1) % count;
+
+    float mul = IsKeyDown(KEY_LEFT_SHIFT) ? 0.2f : 1.0f;
+    ParamRow *p = &params[paramSel];
+
+    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) *p->value += p->step * mul;
+    if (IsKeyPressed(KEY_LEFT)  || IsKeyPressedRepeat(KEY_LEFT))  *p->value -= p->step * mul;
+
+    if (*p->value < p->min) *p->value = p->min;
+    if (*p->value > p->max) *p->value = p->max;
+
+    if (IsKeyPressed(KEY_HOME)) tune = TUNE_DEFAULT;
+}
+
+/*----------------------------------------------------------------------------*/
+/* Rendering                                                                  */
+/*----------------------------------------------------------------------------*/
+static void DrawBackground(void)
+{
+    DrawRectangleGradientV(0, 0, SCREEN_W, GROUND_Y,
+                           (Color){ 12, 14, 30, 255 }, (Color){ 26, 20, 48, 255 });
+
+    Color grid = (Color){ 255, 255, 255, 10 };
+    for (int x = 0; x < SCREEN_W; x += 64) DrawLine(x, 0, x, GROUND_Y, grid);
+    for (int y = 0; y < GROUND_Y; y += 64) DrawLine(0, y, SCREEN_W, y, grid);
+
+    /* ambient glow behind the player so the arena reads as a stage */
+    DrawCircleGradient(player.pos, 220.0f,
+                       (Color){ 70, 140, 255, 22 }, (Color){ 0, 0, 0, 0 });
+
+    DrawRectangle(0, GROUND_Y, SCREEN_W, SCREEN_H - GROUND_Y, (Color){ 20, 22, 40, 255 });
+    DrawRectangleGradientV(0, GROUND_Y, SCREEN_W, 10,
+                           (Color){ 90, 200, 255, 120 }, (Color){ 90, 200, 255, 0 });
+    DrawLineEx((Vector2){ 0, (float)GROUND_Y }, (Vector2){ SCREEN_W, (float)GROUND_Y }, 2.5f,
+               (Color){ 120, 220, 255, 200 });
+}
+
+/* Telegraph for the floor eruption: the player gets a full half-second of
+   glowing, escalating warning before anything actually hurts them. */
+static void DrawGroundHazard(void)
+{
+    float k = GroundDanger();
+    if (k <= 0.0f || !player.alive) return;
+
+    float pulse = 0.55f + 0.45f * sinf((float)GetTime() * (12.0f + 34.0f * k));
+    float w     = 130.0f * (0.55f + 0.45f * k);
+    float x     = player.pos.x;
+    Color hot   = { 255, (unsigned char)(170 - 120 * k), 50, 255 };
+
+    DrawRectangle((int)(x - w / 2), GROUND_Y, (int)w, SCREEN_H - GROUND_Y,
+                  Fade(hot, 0.45f * k * pulse));
+    DrawRectangleGradientV((int)(x - w / 2), (int)(GROUND_Y - 70.0f * k), (int)w,
+                           (int)(70.0f * k), Fade(hot, 0.0f), Fade(hot, 0.55f * pulse));
+    DrawLineEx((Vector2){ x - w / 2, (float)GROUND_Y }, (Vector2){ x + w / 2, (float)GROUND_Y },
+               3.0f, Fade(hot, 0.9f * pulse));
+
+    /* ring closing in on the player = time left */
+    DrawRingLines(player.pos, PLAYER_RADIUS + 34.0f * (1.0f - k),
+                  PLAYER_RADIUS + 34.0f * (1.0f - k) + 2.0f, 0.0f, 360.0f, 32,
+                  Fade(hot, 0.8f * pulse));
+
+    if (GetRandomValue(0, 2) == 0)
+        EmitBurst((Vector2){ x + RandF(-w / 2, w / 2), (float)GROUND_Y }, -PI / 2.0f, 0.3f,
+                  1, 60.0f, 220.0f * k, 0.35f, 3.0f, hot, 260.0f);
+
+    if (k > 0.25f)
+    {
+        UIDrawC(FW_BOLD, "!위험!", x, GROUND_Y - 116.0f, 28.0f,
+                Fade(hot, 0.85f * pulse));
+    }
+}
+
+static void DrawParticles(void)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++)
+    {
+        Particle *p = &particles[i];
+        if (p->life <= 0.0f) continue;
+        float t = p->life / p->maxLife;
+        DrawCircleV(p->pos, p->size * t, Fade(p->color, t));
+    }
+}
+
+/* Stick eyes that stare along `look`. `angry` slants the inner edges down,
+   which is the whole difference between "cute" and "hostile". */
+static void DrawStareEyes(Vector2 pos, Vector2 look, float forward, float spacing,
+                          float ew, float eh, float angry, Color ink)
+{
+    if (Vector2LengthSqr(look) < 0.0001f) look = (Vector2){ 0.0f, 1.0f };
+    look = Vector2Normalize(look);
+
+    /* A bar drawn unrotated is long along +Y, and we want its long axis along
+       `perp` - which is exactly a rotation by the look angle, with no offset. */
+    float   baseRot = atan2f(look.y, look.x) * RAD2DEG;
+    Vector2 perp    = { -look.y, look.x };
+
+    for (int i = 0; i < 2; i++)
+    {
+        float   s = (i == 0) ? 1.0f : -1.0f;
+        Vector2 e = Vector2Add(pos, Vector2Add(Vector2Scale(look, forward),
+                                               Vector2Scale(perp, spacing * s)));
+        DrawRectanglePro((Rectangle){ e.x, e.y, ew + 2.0f, eh + 2.0f },
+                         (Vector2){ (ew + 2.0f) * 0.5f, (eh + 2.0f) * 0.5f },
+                         baseRot + angry * s, Fade(WHITE, 0.85f));
+        DrawRectanglePro((Rectangle){ e.x, e.y, ew, eh },
+                         (Vector2){ ew * 0.5f, eh * 0.5f },
+                         baseRot + angry * s, ink);
+    }
+}
+
+static void DrawPickups(void)
+{
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        const Pickup *pk = &pickups[i];
+        if (!pk->active) continue;
+
+        /* blink out the last three seconds so vanishing is never a surprise */
+        if (pk->life < 3.0f && fmodf(pk->life, 0.3f) < 0.15f) continue;
+
+        Vector2 p    = { pk->pos.x, pk->pos.y + sinf(pk->bob) * 5.0f };
+        Color   c    = PickupColor(pk);
+        Color   ink  = (Color){ 22, 28, 34, 255 };
+        float   rot  = sinf(pk->bob) * 6.0f;
+        float   glow = 0.85f + 0.15f * sinf(pk->bob * 2.0f);
+
+        DrawCircleGradient(p, 46.0f * glow, Fade(c, 0.28f), Fade(c, 0.0f));
+        DrawRectanglePro((Rectangle){ p.x, p.y, 32.0f, 32.0f }, (Vector2){ 16.0f, 16.0f },
+                         rot, WHITE);
+        DrawRectanglePro((Rectangle){ p.x, p.y, 27.0f, 27.0f }, (Vector2){ 13.5f, 13.5f },
+                         rot, c);
+
+        if (pk->kind == PK_HEAL)        /* a cross */
+        {
+            DrawRectanglePro((Rectangle){ p.x, p.y, 15.0f, 5.0f },
+                             (Vector2){ 7.5f, 2.5f }, rot, ink);
+            DrawRectanglePro((Rectangle){ p.x, p.y, 5.0f, 15.0f },
+                             (Vector2){ 2.5f, 7.5f }, rot, ink);
+            continue;
+        }
+
+        switch (pk->weapon)
+        {
+            case WP_SMG:        /* thin barrel over a stubby magazine */
+                DrawRectanglePro((Rectangle){ p.x, p.y - 3.0f, 18.0f, 4.0f },
+                                 (Vector2){ 9.0f, 2.0f }, rot, ink);
+                DrawRectanglePro((Rectangle){ p.x - 3.0f, p.y + 4.0f, 6.0f, 8.0f },
+                                 (Vector2){ 3.0f, 4.0f }, rot, ink);
+                break;
+
+            case WP_SHOTGUN:    /* double barrel */
+                DrawRectanglePro((Rectangle){ p.x, p.y - 4.0f, 17.0f, 4.5f },
+                                 (Vector2){ 8.5f, 2.25f }, rot, ink);
+                DrawRectanglePro((Rectangle){ p.x, p.y + 4.0f, 17.0f, 4.5f },
+                                 (Vector2){ 8.5f, 2.25f }, rot, ink);
+                break;
+
+            case WP_SWORD:      /* an angled blade with a crossguard */
+                DrawRectanglePro((Rectangle){ p.x + 1.0f, p.y - 1.0f, 20.0f, 4.5f },
+                                 (Vector2){ 10.0f, 2.25f }, rot - 45.0f, ink);
+                DrawRectanglePro((Rectangle){ p.x - 5.0f, p.y + 5.0f, 11.0f, 3.5f },
+                                 (Vector2){ 5.5f, 1.75f }, rot + 45.0f, ink);
+                break;
+
+            case WP_GRENADE:    /* a round shell with a lit fuse */
+                DrawCircleV((Vector2){ p.x, p.y + 2.0f }, 7.0f, ink);
+                DrawRectanglePro((Rectangle){ p.x + 4.0f, p.y - 6.0f, 3.0f, 8.0f },
+                                 (Vector2){ 1.5f, 4.0f }, rot + 30.0f, ink);
+                break;
+
+            case WP_RAILGUN:    /* one long lance */
+                DrawRectanglePro((Rectangle){ p.x, p.y, 20.0f, 3.6f },
+                                 (Vector2){ 10.0f, 1.8f }, rot, ink);
+                DrawRectanglePro((Rectangle){ p.x - 6.0f, p.y, 5.0f, 12.0f },
+                                 (Vector2){ 2.5f, 6.0f }, rot, ink);
+                break;
+
+            case WP_BAZOOKA:    /* fat tube with a nose */
+                DrawRectanglePro((Rectangle){ p.x - 2.0f, p.y, 15.0f, 9.0f },
+                                 (Vector2){ 7.5f, 4.5f }, rot, ink);
+                DrawPoly((Vector2){ p.x + 8.0f, p.y }, 3, 6.0f, rot, ink);
+                break;
+
+            case WP_FLAMER:     /* stubby nozzle spitting a flame */
+                DrawRectanglePro((Rectangle){ p.x - 4.0f, p.y, 13.0f, 7.0f },
+                                 (Vector2){ 6.5f, 3.5f }, rot, ink);
+                DrawPoly((Vector2){ p.x + 6.0f, p.y - 1.0f }, 3, 5.5f, rot, ink);
+                DrawPoly((Vector2){ p.x + 9.0f, p.y + 3.0f }, 3, 3.5f, rot + 20.0f, ink);
+                break;
+
+            case WP_RICOCHET:   /* a shot bouncing off two walls */
+                DrawRectanglePro((Rectangle){ p.x - 1.0f, p.y - 5.0f, 14.0f, 3.0f },
+                                 (Vector2){ 7.0f, 1.5f }, rot + 32.0f, ink);
+                DrawRectanglePro((Rectangle){ p.x + 1.0f, p.y + 4.0f, 14.0f, 3.0f },
+                                 (Vector2){ 7.0f, 1.5f }, rot - 32.0f, ink);
+                DrawCircleV((Vector2){ p.x + 8.0f, p.y - 1.0f }, 3.0f, ink);
+                break;
+
+            case WP_HARPOON:    /* one long spike with barbs */
+                DrawRectanglePro((Rectangle){ p.x - 2.0f, p.y, 22.0f, 3.4f },
+                                 (Vector2){ 11.0f, 1.7f }, rot, ink);
+                DrawPoly((Vector2){ p.x + 10.0f, p.y }, 3, 5.5f, rot, ink);
+                DrawRectanglePro((Rectangle){ p.x - 7.0f, p.y, 3.0f, 11.0f },
+                                 (Vector2){ 1.5f, 5.5f }, rot, ink);
+                break;
+
+            case WP_LASER:      /* emitter lens with a thin beam */
+                DrawCircleV((Vector2){ p.x - 6.0f, p.y }, 5.5f, ink);
+                DrawRectanglePro((Rectangle){ p.x + 3.0f, p.y, 18.0f, 2.6f },
+                                 (Vector2){ 9.0f, 1.3f }, rot, ink);
+                break;
+
+            default: break;
+        }
+    }
+}
+
+static void DrawEnemy(const Enemy *e)
+{
+    Color   c    = EnemyColor(e);
+    Vector2 look = Vector2Subtract(player.pos, e->pos);
+    Color   ink  = (Color){ 26, 16, 30, 255 };
+
+    if (e->spawnT > 0.0f)
+    {
+        float t = 1.0f - (e->spawnT / ((e->type == EN_BOSS) ? 1.2f : 0.65f));
+        DrawPolyLinesEx(e->pos, 6, e->radius * (2.4f - 1.4f * t), e->rot, 2.0f, Fade(c, 0.35f + 0.4f * t));
+        DrawPolyLinesEx(e->pos, 6, e->radius * t, e->rot, 2.0f, Fade(c, 0.6f));
+        return;
+    }
+
+    Color body = (e->hitFlash > 0.0f) ? WHITE : c;
+
+    switch (e->type)
+    {
+        case EN_CHASER:
+            DrawCircleGradient(e->pos, e->radius * 2.2f, Fade(c, 0.20f), Fade(c, 0.0f));
+            DrawPoly(e->pos, 3, e->radius, e->rot, body);
+            DrawPolyLinesEx(e->pos, 3, e->radius + 3.0f, -e->rot * 0.5f, 2.0f, Fade(WHITE, 0.55f));
+            DrawStareEyes(e->pos, look, 3.0f, 5.0f, 3.0f, 7.5f, 22.0f, ink);
+            break;
+
+        case EN_DASHER:
+        {
+            DrawCircleGradient(e->pos, e->radius * 2.4f, Fade(c, 0.18f), Fade(c, 0.0f));
+
+            /* the committed lane, drawn while winding up so it can be dodged */
+            if (e->phase == 1)
+            {
+                /* Visible from the very first frame - a warning that fades in
+                   is weakest exactly when there is still time to dodge it. */
+                float t = 1.0f - Clamp(e->timer / DASH_WINDUP, 0.0f, 1.0f);
+                float a = 0.45f + 0.55f * t;
+                for (int i = 1; i < 20; i++)
+                    DrawCircleV(Vector2Add(e->pos, Vector2Scale(e->lockDir, i * 28.0f)),
+                                2.6f, Fade(c, (0.75f - i * 0.033f) * a));
+            }
+
+            Vector2 bp = e->pos;
+            if (e->phase == 1) { bp.x += RandF(-2.0f, 2.0f); bp.y += RandF(-2.0f, 2.0f); }
+
+            DrawPoly(bp, 4, e->radius, e->rot, body);
+            DrawPolyLinesEx(bp, 4, e->radius + 3.0f, e->rot, 2.0f, Fade(WHITE, 0.55f));
+
+            /* one big eye: it snaps wide open and red the instant it commits */
+            Vector2 eyeLook = (e->phase >= 1 && e->phase <= 2) ? e->lockDir : look;
+            bool    hot     = (e->phase == 1 || e->phase == 2);
+            float   ew      = hot ? 8.5f : 6.0f;
+            float   eh      = hot ? 14.0f : 10.0f;
+            DrawStareEyes(bp, eyeLook, 3.0f, 0.0f, ew, eh, 0.0f,
+                          hot ? (Color){ 255, 60, 60, 255 } : ink);
+        } break;
+
+        /* A dasher's shape with the corners knocked off and a lock-on cone
+           instead of a lane. The cone follows you while it winds up, which is
+           the whole difference between the two enemies, so it has to be the
+           loudest thing about it. */
+        case EN_RUSHER:
+        {
+            DrawCircleGradient(e->pos, e->radius * 2.6f, Fade(c, 0.22f), Fade(c, 0.0f));
+
+            if (e->phase == 1)
+            {
+                float t   = 1.0f - Clamp(e->timer / RUSH_LOCK, 0.0f, 1.0f);
+                float deg = atan2f(e->lockDir.y, e->lockDir.x) * RAD2DEG;
+
+                /* The cone tightens as the lock completes - open means there is
+                   still time to leave, closed means it is already coming. */
+                float spread = 26.0f - 20.0f * t;
+                DrawRing(e->pos, e->radius + 10.0f, e->radius + 640.0f,
+                         deg - spread, deg + spread, 12, Fade(c, 0.10f + 0.10f * t));
+
+                for (int i = 1; i < 22; i++)
+                    DrawCircleV(Vector2Add(e->pos, Vector2Scale(e->lockDir, i * 30.0f)),
+                                3.0f, Fade(c, (0.8f - i * 0.03f) * (0.4f + 0.6f * t)));
+
+                /* the reticle itself, sitting on the player */
+                float r = 26.0f - 12.0f * t;
+                DrawCircleLines((int)player.pos.x, (int)player.pos.y, r,
+                                Fade(c, 0.35f + 0.5f * t));
+            }
+
+            Vector2 bp = e->pos;
+            if (e->phase == 1) { bp.x += RandF(-3.0f, 3.0f); bp.y += RandF(-3.0f, 3.0f); }
+
+            DrawPoly(bp, 5, e->radius, e->rot, body);
+            DrawPolyLinesEx(bp, 5, e->radius + 4.0f, -e->rot * 0.6f, 2.5f, Fade(WHITE, 0.6f));
+
+            /* One pip per dash still in the volley: the count is the threat. */
+            for (int i = 0; i < e->gen; i++)
+                DrawCircleV((Vector2){ bp.x - 9.0f + i * 9.0f, bp.y - e->radius - 9.0f },
+                            2.6f, Fade(WHITE, 0.8f));
+
+            {
+                bool hot = (e->phase == 1 || e->phase == 2);
+                DrawStareEyes(bp, (e->phase >= 1 && e->phase <= 2) ? e->lockDir : look,
+                              3.0f, 4.0f, hot ? 4.0f : 3.0f, hot ? 13.0f : 9.0f, 26.0f,
+                              hot ? (Color){ 255, 70, 50, 255 } : ink);
+            }
+        } break;
+
+        /* A hunched thrower with a live charge held over its head - the charge
+           is the tell, and it brightens as the throw comes due. */
+        case EN_BOMBARDIER:
+        {
+            DrawCircleGradient(e->pos, e->radius * 2.4f, Fade(c, 0.18f), Fade(c, 0.0f));
+
+            DrawPoly(e->pos, 5, e->radius, e->rot, body);
+            DrawPolyLinesEx(e->pos, 5, e->radius + 3.0f, -e->rot * 0.5f, 2.0f,
+                            Fade(WHITE, 0.5f));
+
+            float ready = 1.0f - Clamp(e->timer / 1.5f, 0.0f, 1.0f);
+            Vector2 hold = { e->pos.x, e->pos.y - e->radius - 9.0f };
+            DrawCircleV(hold, 5.5f, Fade((Color){ 240, 255, 160, 255 },
+                                         0.45f + 0.55f * ready));
+            DrawCircleLines((int)hold.x, (int)hold.y, 8.0f + 3.0f * ready,
+                            Fade(WHITE, 0.25f + 0.45f * ready));
+
+            DrawStareEyes(e->pos, look, 2.0f, 5.0f, 3.0f, 7.0f, 14.0f, ink);
+        } break;
+
+        case EN_SPLITTER:
+            DrawCircleGradient(e->pos, e->radius * 2.2f, Fade(c, 0.20f), Fade(c, 0.0f));
+            DrawPoly(e->pos, 6, e->radius, e->rot, body);
+            DrawPolyLinesEx(e->pos, 6, e->radius + 4.0f, -e->rot, 2.0f, Fade(WHITE, 0.45f));
+            DrawStareEyes(e->pos, look, 2.0f, (e->tier == 0) ? 8.0f : 4.5f,
+                          (e->tier == 0) ? 4.0f : 2.6f, (e->tier == 0) ? 10.0f : 6.5f,
+                          0.0f, ink);
+            break;
+
+        /* A squat emplacement with a barrel that tracks you. It sits flat -
+           no spin - so it reads as furniture rather than something alive. */
+        case EN_TURRET:
+        {
+            Vector2 aim = Vector2Normalize(look);
+            if (Vector2LengthSqr(aim) < 0.001f) aim = (Vector2){ 0.0f, -1.0f };
+
+            DrawCircleGradient(e->pos, e->radius * 2.2f, Fade(c, 0.18f), Fade(c, 0.0f));
+
+            /* barrel first, so the housing sits on top of it */
+            float   deg = atan2f(aim.y, aim.x) * RAD2DEG;
+            Vector2 bp  = Vector2Add(e->pos, Vector2Scale(aim, 6.0f));
+            DrawRectanglePro((Rectangle){ bp.x, bp.y, 26.0f, 9.0f },
+                             (Vector2){ 0.0f, 4.5f }, deg, Fade(WHITE, 0.55f));
+            DrawRectanglePro((Rectangle){ bp.x, bp.y, 24.0f, 6.0f },
+                             (Vector2){ 0.0f, 3.0f }, deg, body);
+
+            DrawPoly(e->pos, 4, e->radius, 45.0f, body);
+            DrawPolyLinesEx(e->pos, 4, e->radius + 3.0f, 45.0f, 2.0f, Fade(WHITE, 0.5f));
+
+            /* the muzzle glows as the next volley comes due */
+            float heat = 1.0f - Clamp(e->timer / 1.1f, 0.0f, 1.0f);
+            if (heat > 0.0f)
+                DrawCircleV(Vector2Add(e->pos, Vector2Scale(aim, 30.0f)),
+                            2.0f + 3.0f * heat, Fade(WHITE, 0.35f + 0.55f * heat));
+
+            DrawStareEyes(e->pos, aim, 0.0f, 5.0f, 3.0f, 6.0f, 18.0f, ink);
+        } break;
+
+        /* Small body, big shield. The shield is drawn as a solid arc at the
+           exact half-angle the damage test uses, so "am I behind it yet" is a
+           question you answer by looking rather than by guessing. */
+        case EN_SHIELDER:
+        {
+            float   sdeg = e->timer2 * RAD2DEG;
+            Vector2 face = FromAngle(e->timer2, 1.0f);
+            float   lit  = Clamp(e->guardT / 0.22f, 0.0f, 1.0f);
+
+            DrawCircleGradient(e->pos, e->radius * 2.2f, Fade(c, 0.16f), Fade(c, 0.0f));
+
+            DrawPoly(e->pos, 6, e->radius, e->rot, body);
+            DrawPolyLinesEx(e->pos, 6, e->radius + 3.0f, e->rot, 2.0f, Fade(WHITE, 0.45f));
+            DrawStareEyes(e->pos, look, 2.0f, 5.0f, 3.0f, 7.0f, 20.0f, ink);
+
+            /* The plate. DrawRing takes degrees and sweeps clockwise from
+               `start`, so the arc is centred by opening SHIELD_ARC either side
+               of the facing - the same number ShieldBlocks compares against.
+               Nothing is drawn once it is broken: the enemy has to LOOK
+               harmless from every angle the instant it actually is. */
+            if (e->shield > 0.0f)
+            {
+                float half  = SHIELD_ARC * RAD2DEG;
+                float left  = Clamp(e->shield / e->shieldMax, 0.0f, 1.0f);
+                Color plate = (lit > 0.0f) ? WHITE : (Color){ 225, 245, 255, 255 };
+
+                DrawRing(e->pos, e->radius + 5.0f, e->radius + 15.0f,
+                         sdeg - half, sdeg + half, 30, Fade(plate, 0.30f + 0.55f * left));
+                DrawRing(e->pos, e->radius + 15.0f, e->radius + 18.0f,
+                         sdeg - half, sdeg + half, 30, Fade(c, 0.9f));
+
+                /* How much plate is left, drawn as plate: the arc shortens from
+                   both ends, so a nearly-broken shield is visibly a smaller
+                   thing to get around as well as a weaker one. */
+                DrawRing(e->pos, e->radius + 6.0f, e->radius + 14.0f,
+                         sdeg - half * left, sdeg + half * left, 30,
+                         Fade(WHITE, 0.75f));
+
+                /* the flare of a block, thrown out past the plate */
+                if (lit > 0.0f)
+                    DrawRing(e->pos, e->radius + 18.0f, e->radius + 26.0f + 10.0f * lit,
+                             sdeg - half, sdeg + half, 30, Fade(WHITE, 0.55f * lit));
+
+                /* A brace from the body to the plate: without it the arc reads
+                   as a free-floating decoration rather than as something it is
+                   holding. */
+                DrawLineEx(Vector2Add(e->pos, Vector2Scale(face, e->radius * 0.4f)),
+                           Vector2Add(e->pos, Vector2Scale(face, e->radius + 8.0f)),
+                           4.0f, Fade(plate, 0.7f));
+            }
+            else
+            {
+                /* Two broken stubs where the brace used to be. */
+                Vector2 perp = { -face.y, face.x };
+                for (int s = -1; s <= 1; s += 2)
+                {
+                    Vector2 a = Vector2Add(e->pos, Vector2Scale(perp, s * e->radius * 0.6f));
+                    DrawLineEx(a, Vector2Add(a, Vector2Scale(face, 7.0f)), 3.0f,
+                               Fade((Color){ 225, 245, 255, 255 }, 0.35f));
+                }
+            }
+
+            /* winding up a bash: the lane it will cover, same as a dasher */
+            if (e->phase == 1)
+            {
+                float t = 1.0f - Clamp(e->timer / 0.55f, 0.0f, 1.0f);
+                for (int i = 1; i < 14; i++)
+                    DrawCircleV(Vector2Add(e->pos, Vector2Scale(e->lockDir, i * 26.0f)),
+                                2.4f, Fade(c, (0.7f - i * 0.045f) * (0.5f + 0.5f * t)));
+            }
+        } break;
+
+        /* Round, and visibly counting down. The fuse blink is the only warning
+           you get, so it speeds up the closer it is to reaching you. */
+        case EN_BOMBER:
+        {
+            float near  = 1.0f - Clamp(Vector2Length(look) / 320.0f, 0.0f, 1.0f);
+            float blink = 0.5f + 0.5f * sinf(e->timer * (7.0f + 16.0f * near));
+
+            DrawCircleGradient(e->pos, e->radius * 2.6f,
+                               Fade(c, 0.18f + 0.20f * blink), Fade(c, 0.0f));
+            DrawCircleV(e->pos, e->radius + 2.5f, Fade(WHITE, 0.5f));
+            DrawCircleV(e->pos, e->radius, body);
+
+            /* the charge inside, pulsing brighter as it closes */
+            DrawCircleV(e->pos, e->radius * 0.45f,
+                        Fade((Color){ 255, 245, 200, 255 }, 0.35f + 0.65f * blink));
+
+            DrawStareEyes(e->pos, look, 2.0f, 5.0f, 3.0f, 7.0f, 26.0f, ink);
+        } break;
+
+        case EN_BOSS:
+        {
+            DrawCircleGradient(e->pos, e->radius * 2.6f, Fade(c, 0.25f), Fade(c, 0.0f));
+
+            /* the charger shows its lane the whole wind-up, same as a dasher */
+            if (e->tier == BK_CHARGER && e->phase == 1)
+            {
+                float t = 1.0f - Clamp(e->timer / 0.85f, 0.0f, 1.0f);
+                for (int i = 1; i < 26; i++)
+                    DrawCircleV(Vector2Add(e->pos, Vector2Scale(e->lockDir, i * 32.0f)),
+                                4.0f, Fade(c, (0.8f - i * 0.028f) * (0.45f + 0.55f * t)));
+            }
+
+            /* The vortex wears its mechanic: rings falling inward while it
+               pulls, and a bright ring collapsing onto the body during the
+               wind-up so the reversal is something you can see coming rather
+               than something that happens to you. */
+            if (e->tier == BK_VORTEX)
+            {
+                float spin = e->rot * DEG2RAD;
+                for (int i = 0; i < 3; i++)
+                {
+                    float phase = fmodf((float)GetTime() * 0.9f + i * 0.333f, 1.0f);
+                    float rr    = e->radius + 150.0f * (1.0f - phase);
+                    DrawCircleLines((int)e->pos.x, (int)e->pos.y, rr,
+                                    Fade(c, 0.42f * phase));
+                }
+                for (int i = 0; i < 10; i++)
+                {
+                    float a = spin * 0.6f + (2.0f * PI * i) / 10.0f;
+                    float d = e->radius + 26.0f + 24.0f * sinf((float)GetTime() * 3.0f + i);
+                    DrawCircleV(Vector2Add(e->pos, FromAngle(a, d)), 2.6f, Fade(c, 0.7f));
+                }
+                if (e->phase == 1)
+                {
+                    float t = 1.0f - Clamp(e->timer2 / 0.9f, 0.0f, 1.0f);
+                    DrawCircleLines((int)e->pos.x, (int)e->pos.y,
+                                    e->radius + 210.0f * (1.0f - t), Fade(WHITE, 0.35f + 0.5f * t));
+                }
+            }
+
+            /* The lancer shows its lane exactly like the charger does, but the
+               lane keeps moving while it locks - that difference is the fight,
+               so it has to be visible before the first dash lands. */
+            if (e->tier == BK_LANCER && e->phase == 1)
+            {
+                float t = 1.0f - Clamp(e->timer / 0.75f, 0.0f, 1.0f);
+                for (int i = 1; i < 30; i++)
+                    DrawCircleV(Vector2Add(e->pos, Vector2Scale(e->lockDir, i * 30.0f)),
+                                3.4f, Fade(c, (0.8f - i * 0.025f) * (0.45f + 0.55f * t)));
+                DrawCircleLines((int)player.pos.x, (int)player.pos.y,
+                                34.0f - 16.0f * t, Fade(c, 0.4f + 0.5f * t));
+            }
+
+            /* The mortar telegraphs the carpet by where it is pointing next. */
+            if (e->tier == BK_MORTAR && e->phase == 1)
+            {
+                float x = 110.0f + Clamp((float)e->gen, 0.0f, 9.0f)
+                                       * ((SCREEN_W - 220.0f) / 9.0f);
+                DrawLineEx((Vector2){ x, (float)GROUND_Y - 90.0f },
+                           (Vector2){ x, (float)GROUND_Y }, 3.0f, Fade(c, 0.5f));
+                DrawCircleLines((int)x, GROUND_Y - 24, BOMB_RADIUS, Fade(c, 0.35f));
+            }
+
+            int sides = (e->tier == BK_SUMMONER) ? 6 :
+                        (e->tier == BK_CHARGER)  ? 3 :
+                        (e->tier == BK_VORTEX)   ? 8 :
+                        (e->tier == BK_BULWARK)  ? 6 :
+                        (e->tier == BK_LANCER)   ? 4 :
+                        (e->tier == BK_MORTAR)   ? 7 : 5;
+            DrawPoly(e->pos, sides, e->radius, e->rot, body);
+            DrawPolyLinesEx(e->pos, sides, e->radius + 6.0f, -e->rot * 0.7f, 3.0f,
+                            Fade(WHITE, 0.6f));
+
+            Vector2 bossLook = ((e->tier == BK_CHARGER || e->tier == BK_LANCER) &&
+                                e->phase >= 1 && e->phase <= 2) ? e->lockDir : look;
+            DrawStareEyes(e->pos, bossLook, 6.0f, 15.0f, 7.0f, 20.0f, 20.0f, ink);
+
+            /* The bulwark's plate, drawn over the body: same arc the damage
+               test uses, sweeping at its own rate. What is left of it shows as
+               the length of the bright inner band, so the opening you have to
+               get to visibly widens as you wear it down. */
+            if (e->tier == BK_BULWARK && e->shield > 0.0f)
+            {
+                float sdeg = e->timer2 * RAD2DEG;
+                float half = SHIELD_ARC * RAD2DEG;
+                float left = Clamp(e->shield / e->shieldMax, 0.0f, 1.0f);
+                float lit  = Clamp(e->guardT / 0.22f, 0.0f, 1.0f);
+
+                DrawRing(e->pos, e->radius + 8.0f, e->radius + 24.0f,
+                         sdeg - half, sdeg + half, 36,
+                         Fade((lit > 0.0f) ? WHITE : (Color){ 225, 245, 255, 255 },
+                              0.30f + 0.55f * left));
+                DrawRing(e->pos, e->radius + 10.0f, e->radius + 21.0f,
+                         sdeg - half * left, sdeg + half * left, 36, Fade(WHITE, 0.75f));
+                DrawRing(e->pos, e->radius + 24.0f, e->radius + 28.0f,
+                         sdeg - half, sdeg + half, 36, Fade(c, 0.9f));
+            }
+
+            /* Scaled off the body rather than fixed, so a shoal of fragments
+               does not turn into a stack of overlapping full-width bars. */
+            float w = e->radius * 3.4f, hpT = e->hp / e->maxHp;
+            DrawRectangle((int)(e->pos.x - w / 2), (int)(e->pos.y - e->radius - 22), (int)w, 7,
+                          (Color){ 0, 0, 0, 160 });
+            DrawRectangle((int)(e->pos.x - w / 2), (int)(e->pos.y - e->radius - 22), (int)(w * hpT), 7, c);
+        } break;
+    }
+}
+
+static void DrawPlayer(void)
+{
+    if (!player.alive) return;
+
+    bool blink = (player.invuln > 0.0f) && (fmodf(player.invuln, 0.16f) < 0.08f);
+    Color body = blink ? (Color){ 255, 120, 120, 255 } : (Color){ 120, 230, 255, 255 };
+    float aimDeg = player.aim * RAD2DEG;
+
+    /* aim guide + recoil direction preview */
+    Vector2 aimDir = FromAngle(player.aim, 1.0f);
+    for (int i = 2; i < 14; i++)
+    {
+        float d = PLAYER_RADIUS + 10.0f + i * 14.0f;
+        DrawCircleV(Vector2Add(player.pos, Vector2Scale(aimDir, d)), 1.6f,
+                    Fade((Color){ 150, 230, 255, 255 }, 0.35f - i * 0.02f));
+    }
+    Vector2 back = Vector2Add(player.pos, Vector2Scale(aimDir, -(PLAYER_RADIUS + 26.0f)));
+    DrawPoly(back, 3, 7.0f, aimDeg + 180.0f, Fade((Color){ 255, 190, 90, 255 }, 0.55f));
+
+    DrawCircleGradient(player.pos, 46.0f, Fade(body, 0.28f), Fade(body, 0.0f));
+
+    /* --- katana: carried out to the side, swept through the aim on a slash --- */
+    const WeaponDef *w = &WEAPONS[player.weapon];
+    if (w->slash)
+    {
+        float side  = (float)((player.swingSide >= 0) ? 1 : -1);
+        float rest  = aimDeg + 104.0f * side;             /* held at the hip   */
+        float from  = aimDeg + 118.0f * side;             /* wind-up           */
+        float to    = aimDeg -  62.0f * side;             /* follow-through    */
+        float bladeDeg = rest;
+
+        if (player.swingT > 0.0f)
+        {
+            float p = 1.0f - Clamp(player.swingT / SWORD_SWING, 0.0f, 1.0f);
+            float e = 1.0f - powf(1.0f - p, 3.0f);        /* fast out, settling */
+            bladeDeg = from + (to - from) * e;
+
+            /* the arc the blade has already carved */
+            float a0 = fminf(from, bladeDeg), a1 = fmaxf(from, bladeDeg);
+            DrawRing(player.pos, 24.0f, 44.0f, a0, a1, 28,
+                     Fade(w->color, 0.30f * (1.0f - p)));
+            DrawRing(player.pos, 36.0f, 42.0f, a0, a1, 28,
+                     Fade(WHITE, 0.45f * (1.0f - p)));
+        }
+
+        Vector2 dir  = FromAngle(bladeDeg * DEG2RAD, 1.0f);
+        Vector2 grip = Vector2Add(player.pos, Vector2Scale(dir, 4.0f));
+
+        /* handle behind the hand, then guard, then the blade itself */
+        DrawRectanglePro((Rectangle){ grip.x, grip.y, 13.0f, 6.0f },
+                         (Vector2){ 13.0f, 3.0f }, bladeDeg, (Color){ 60, 48, 44, 255 });
+        DrawRectanglePro((Rectangle){ grip.x, grip.y, 4.0f, 16.0f },
+                         (Vector2){ 2.0f, 8.0f }, bladeDeg, (Color){ 220, 195, 120, 255 });
+
+        Vector2 base = Vector2Add(grip, Vector2Scale(dir, 3.0f));
+        DrawRectanglePro((Rectangle){ base.x, base.y, 38.0f, 7.0f },
+                         (Vector2){ 0.0f, 3.5f }, bladeDeg, (Color){ 240, 246, 255, 255 });
+        DrawRectanglePro((Rectangle){ base.x, base.y, 36.0f, 3.0f },
+                         (Vector2){ 0.0f, 2.6f }, bladeDeg, w->color);
+    }
+    else
+    {
+        /* --- gun, drawn first so the box reads as holding it --- */
+        float   kick = (player.muzzle > 0.0f)
+                           ? (player.muzzle / 0.07f) * 5.0f * w->recoilMul : 0.0f;
+        Vector2 gunBase = Vector2Add(player.pos, Vector2Scale(aimDir, 9.0f - kick));
+        Color   metal   = (player.weapon == WP_PISTOL) ? (Color){ 58, 74, 104, 255 }
+                                                       : w->color;
+
+        DrawRectanglePro((Rectangle){ gunBase.x, gunBase.y,
+                                      w->gunLen + 2.0f, w->gunThick + 4.0f },
+                         (Vector2){ 1.0f, (w->gunThick + 4.0f) * 0.5f }, aimDeg,
+                         (Color){ 235, 245, 255, 255 });
+        DrawRectanglePro((Rectangle){ gunBase.x, gunBase.y, w->gunLen, w->gunThick },
+                         (Vector2){ 0.0f, w->gunThick * 0.5f }, aimDeg, metal);
+
+        /* muzzle block, so it reads as a weapon rather than an antenna */
+        Vector2 tip = Vector2Add(gunBase, Vector2Scale(aimDir, w->gunLen - 4.0f));
+        DrawRectanglePro((Rectangle){ tip.x, tip.y, 9.0f, w->gunThick + 8.0f },
+                         (Vector2){ 4.5f, (w->gunThick + 8.0f) * 0.5f }, aimDeg,
+                         (Color){ 235, 245, 255, 255 });
+        DrawRectanglePro((Rectangle){ tip.x, tip.y, 6.0f, w->gunThick + 4.0f },
+                         (Vector2){ 3.0f, (w->gunThick + 4.0f) * 0.5f }, aimDeg,
+                         (player.weapon == WP_PISTOL) ? (Color){ 78, 98, 134, 255 } : metal);
+
+        if (player.muzzle > 0.0f)
+        {
+            Vector2 m = Vector2Add(player.pos, Vector2Scale(aimDir, PLAYER_RADIUS + 12.0f));
+            DrawCircleV(m, 14.0f * (player.muzzle / 0.07f),
+                        Fade((Color){ 255, 240, 180, 255 }, 0.85f));
+        }
+    }
+
+    /* --- body: an upright box that leans into its motion and stretches when
+           it is moving fast vertically --- */
+    float tilt = Clamp(player.vel.x * 0.020f, -18.0f, 18.0f);
+    float sq   = Clamp(fabsf(player.vel.y) / 900.0f, 0.0f, 0.35f);
+    float bw   = 26.0f * (1.0f - sq * 0.45f);
+    float bh   = 26.0f * (1.0f + sq * 0.45f);
+
+    DrawRectanglePro((Rectangle){ player.pos.x, player.pos.y, bw + 4.0f, bh + 4.0f },
+                     (Vector2){ (bw + 4.0f) * 0.5f, (bh + 4.0f) * 0.5f }, tilt, WHITE);
+    DrawRectanglePro((Rectangle){ player.pos.x, player.pos.y, bw, bh },
+                     (Vector2){ bw * 0.5f, bh * 0.5f }, tilt, body);
+
+    /* --- stick eyes: they lean with the body and glance toward the aim --- */
+    {
+        float   rad = tilt * DEG2RAD, cs = cosf(rad), sn = sinf(rad);
+        Vector2 look = Vector2Scale(aimDir, 2.6f);
+        bool    shut = (player.blinkTimer <= 0.0f) || (player.invuln > 0.0f);
+        Color   ink  = (Color){ 18, 26, 46, 255 };
+
+        for (int i = 0; i < 2; i++)
+        {
+            float lx = (i == 0) ? -5.6f : 5.6f;
+            float ly = -1.5f;
+            Vector2 e = { player.pos.x + lx * cs - ly * sn + look.x,
+                          player.pos.y + lx * sn + ly * cs + look.y };
+
+            if (shut)
+                DrawRectanglePro((Rectangle){ e.x, e.y, 8.2f, 2.8f },
+                                 (Vector2){ 4.1f, 1.4f }, tilt, ink);
+            else
+                DrawRectanglePro((Rectangle){ e.x, e.y, 3.4f, 9.4f },
+                                 (Vector2){ 1.7f, 4.7f }, tilt, ink);
+        }
+    }
+
+    /* AEGIS. There is no bubble to hold up any more - the roll happens on the
+       hit - so a faint ring says "you own this" and it flares hard on a save. */
+    if (upStacks[UP_AEGIS] > 0)
+    {
+        Color sc = { 120, 210, 255, 255 };
+        float idle = 0.10f + 0.05f * sinf((float)GetTime() * 2.4f);
+
+        DrawRing(player.pos, PLAYER_RADIUS + 11.0f, PLAYER_RADIUS + 12.5f,
+                 0.0f, 360.0f, 40, Fade(sc, idle));
+
+        if (player.shieldFlash > 0.0f)
+        {
+            float k = Clamp(player.shieldFlash / 0.35f, 0.0f, 1.0f);
+            float r = PLAYER_RADIUS + 12.0f + 10.0f * (1.0f - k);
+
+            DrawCircleGradient(player.pos, r * 1.6f, Fade(sc, 0.22f * k), Fade(sc, 0.0f));
+            DrawRing(player.pos, r - 3.0f, r, 0.0f, 360.0f, 40, Fade(sc, 0.35f + 0.6f * k));
+        }
+    }
+
+    /* Fire-ready ring. With infinite ammo this is the only throttle the player
+       has to read, so it lives right on the character. */
+    {
+        float interval = tune.fireCooldown * w->cooldownMul * UpFireMul();
+        float t = (player.cooldown > 0.0f && interval > 0.0f)
+                      ? 1.0f - Clamp(player.cooldown / interval, 0.0f, 1.0f)
+                      : 1.0f;
+        Color ring = w->color;
+
+        DrawRing(player.pos, PLAYER_RADIUS + 13.0f, PLAYER_RADIUS + 16.5f,
+                 -90.0f, -90.0f + 360.0f * t, 40, Fade(ring, (t >= 1.0f) ? 0.85f : 0.45f));
+    }
+
+    if (player.combo > 0)
+    {
+        /* Grows on every kill and eases back down, so it needs the unsnapped
+           draw - and rests exactly on the grid because the base is snapped. */
+        float pop = 1.0f + player.comboFlash * 1.4f;
+        UIDrawCFree(FW_BOLD, TextFormat("x%.1f", ComboMultiplier()),
+                    player.pos.x, player.pos.y - 58.0f, UISize(24.0f) * pop,
+                    (Color){ 255, 220, 100, 220 });
+    }
+}
+
+static void DrawBullets(void)
+{
+    for (int i = 0; i < MAX_BULLETS; i++)
+    {
+        Bullet *b = &bullets[i];
+        if (!b->active) continue;
+
+        if (b->slash)
+        {
+            /* a crescent of sword energy, thinning as it dissipates */
+            float t   = Clamp(b->life / b->maxLife, 0.0f, 1.0f);
+            float ang = atan2f(b->vel.y, b->vel.x) * RAD2DEG;
+            float r   = b->radius * (1.35f - 0.35f * t);
+
+            DrawCircleGradient(b->pos, r * 2.0f, Fade(b->color, 0.22f * t),
+                               Fade(b->color, 0.0f));
+            DrawRing(b->pos, r * 0.62f, r, ang - 74.0f, ang + 74.0f, 24,
+                     Fade(b->color, 0.85f * t));
+            DrawRing(b->pos, r * 0.80f, r * 0.95f, ang - 66.0f, ang + 66.0f, 24,
+                     Fade(WHITE, 0.9f * t));
+            continue;
+        }
+
+        /* A thrown charge is not a bullet you dodge, it is a timer you leave -
+           so it is drawn as an object with a fuse, blinking faster as it runs
+           out, and it shows the blast it is about to make. */
+        if (b->explosive && !b->fromPlayer)
+        {
+            float t     = Clamp(b->life / b->maxLife, 0.0f, 1.0f);
+            float blink = 0.5f + 0.5f * sinf(b->life * (9.0f + 26.0f * (1.0f - t)));
+
+            DrawCircleLines((int)b->pos.x, (int)b->pos.y, BOMB_RADIUS,
+                            Fade(b->color, 0.10f + 0.16f * blink));
+            DrawCircleGradient(b->pos, b->radius * 3.0f,
+                               Fade(b->color, 0.25f + 0.25f * blink),
+                               Fade(b->color, 0.0f));
+            DrawCircleV(b->pos, b->radius, (Color){ 60, 62, 40, 255 });
+            DrawCircleV(b->pos, b->radius * 0.62f,
+                        Fade((Color){ 255, 255, 210, 255 }, 0.4f + 0.6f * blink));
+            DrawCircleLines((int)b->pos.x, (int)b->pos.y, b->radius + 2.0f,
+                            Fade(b->color, 0.9f));
+            continue;
+        }
+
+        Vector2 tail = Vector2Subtract(b->pos, Vector2Scale(b->vel, 0.016f));
+        DrawCircleGradient(b->pos, b->radius * 3.5f,
+                           Fade(b->color, 0.30f), Fade(b->color, 0.0f));
+        DrawLineEx(tail, b->pos, b->radius * 1.4f, Fade(b->color, 0.8f));
+        DrawCircleV(b->pos, b->radius, WHITE);
+        DrawCircleV(b->pos, b->radius * 0.7f, b->color);
+    }
+}
+
+static void DrawCrosshair(void)
+{
+    Vector2 m = VirtualMouse();
+    Color   c = (player.alive && state == ST_PLAY) ? (Color){ 255, 235, 180, 230 }
+                                                   : (Color){ 200, 215, 240, 200 };
+
+    DrawRing(m, 9.0f, 10.5f, 0.0f, 360.0f, 28, Fade(c, 0.55f));
+    DrawLineEx((Vector2){ m.x - 17, m.y }, (Vector2){ m.x - 6, m.y }, 2.0f, c);
+    DrawLineEx((Vector2){ m.x + 6,  m.y }, (Vector2){ m.x + 17, m.y }, 2.0f, c);
+    DrawLineEx((Vector2){ m.x, m.y - 17 }, (Vector2){ m.x, m.y - 6 }, 2.0f, c);
+    DrawLineEx((Vector2){ m.x, m.y + 6  }, (Vector2){ m.x, m.y + 17 }, 2.0f, c);
+    DrawCircleV(m, 1.8f, c);
+}
+
+static void DrawPopups(void)
+{
+    for (int i = 0; i < MAX_POPUPS; i++)
+    {
+        if (!popups[i].active) continue;
+        float a = popups[i].life / 0.8f;
+        const char *t = popups[i].label ? popups[i].label
+                                        : TextFormat("%d", popups[i].value);
+        UIDrawC(FW_BOLD, t, popups[i].pos.x, popups[i].pos.y, 20.0f,
+                Fade(popups[i].color, a));
+    }
+}
+
+static void DrawHud(void)
+{
+    UIDraw(FW_BOLD, TextFormat("%ld", score), 24.0f, 14.0f, 44.0f, RAYWHITE);
+    UIDraw(FW_REG, TextFormat("최고 %ld", bestScore), 26.0f, 64.0f, 20.0f,
+           (Color){ 160, 170, 200, 255 });
+
+    UIDrawC(FW_BOLD, TextFormat("웨이브 %d", wave), SCREEN_W / 2.0f, 18.0f, 28.0f,
+            (Color){ 200, 215, 255, 255 });
+
+    /* hp */
+    for (int i = 0; i < PlayerMaxHp(); i++)
+    {
+        /* little boxes, so the life icons read as "one more of you" */
+        int x = (int)(SCREEN_W - 44.0f - i * 30.0f), y = 24;
+        if (i < player.hp)
+        {
+            DrawRectangle(x, y, 20, 20, (Color){ 120, 230, 255, 255 });
+            DrawRectangle(x + 5,  y + 6, 3, 8, (Color){ 18, 26, 46, 255 });
+            DrawRectangle(x + 12, y + 6, 3, 8, (Color){ 18, 26, 46, 255 });
+        }
+        else DrawRectangleLinesEx((Rectangle){ (float)x, (float)y, 20.0f, 20.0f }, 2.0f,
+                                  (Color){ 120, 230, 255, 70 });
+    }
+
+    /* current weapon - permanent, so it is simply stated rather than timed */
+    {
+        const WeaponDef *w = &WEAPONS[player.weapon];
+        UIDraw(FW_REG, "무기", 24.0f, SCREEN_H - 98.0f, 20.0f,
+               (Color){ 160, 170, 200, 200 });
+        UIDraw(FW_BOLD, w->name, 24.0f, SCREEN_H - 74.0f, 28.0f, w->color);
+    }
+
+    if (player.combo > 0)
+    {
+        UIDrawC(FW_BOLD, TextFormat("무착지 콤보  x%.1f", ComboMultiplier()),
+                SCREEN_W / 2.0f, SCREEN_H - 44.0f, 24.0f,
+                (Color){ 255, 220, 100, 220 });
+    }
+
+    /* post-boss breather */
+    if (state == ST_PLAY && waveCleared && wave % 5 == 0)
+    {
+        UIDrawC(FW_BOLD, "보스 격파", SCREEN_W / 2.0f, SCREEN_H / 2.0f - 132.0f, 56.0f,
+                (Color){ 255, 200, 120, 255 });
+        UIDrawC(FW_REG, TextFormat("휴식 시간  -  %.0f", ceilf(intermission)),
+                SCREEN_W / 2.0f, SCREEN_H / 2.0f - 60.0f, 24.0f,
+                (Color){ 200, 215, 245, 220 });
+    }
+
+    if (waveBannerT > 0.0f && state == ST_PLAY)
+    {
+        float a = (waveBannerT > 1.2f) ? (1.6f - waveBannerT) / 0.4f : waveBannerT / 1.2f;
+        const char *t = (wave % 5 == 0) ? TextFormat("웨이브 %d  -  보스", wave)
+                                        : TextFormat("웨이브 %d", wave);
+        UIDrawC(FW_BOLD, t, SCREEN_W / 2.0f, SCREEN_H / 2.0f - 120.0f, 70.0f,
+                Fade(RAYWHITE, a * 0.9f));
+    }
+
+    if (!panelVisible)
+        UIDraw(FW_REG, "F1  튜닝", SCREEN_W - 116.0f, SCREEN_H - 30.0f, 18.0f,
+               (Color){ 120, 130, 160, 180 });
+}
+
+static void DrawPanel(void)
+{
+    if (!panelVisible) return;
+
+    int w = 376, h = PARAM_COUNT * 32 + 116;
+    int x = SCREEN_W - w - 20, y = 90;
+
+    DrawRectangle(x, y, w, h, (Color){ 8, 10, 22, 225 });
+    DrawRectangleLines(x, y, w, h, (Color){ 90, 200, 255, 160 });
+    UIDraw(FW_BOLD, "손맛 튜닝", x + 16.0f, y + 12.0f, 24.0f, (Color){ 120, 230, 255, 255 });
+
+    for (int i = 0; i < PARAM_COUNT; i++)
+    {
+        int ry = y + 52 + i * 32;
+        bool sel = (i == paramSel);
+        if (sel) DrawRectangle(x + 6, ry - 5, w - 12, 30, (Color){ 90, 200, 255, 40 });
+
+        Color nameCol = sel ? RAYWHITE : (Color){ 165, 175, 200, 255 };
+        UIDraw(sel ? FW_BOLD : FW_REG, params[i].name, x + 16.0f, (float)ry, 20.0f, nameCol);
+
+        const char *v = TextFormat("%.*f", params[i].decimals, *params[i].value);
+        UIDraw(sel ? FW_BOLD : FW_REG, v,
+               x + w - 16.0f - UIWidth(sel ? FW_BOLD : FW_REG, v, 20.0f), (float)ry, 20.0f,
+               sel ? (Color){ 255, 225, 120, 255 } : (Color){ 200, 210, 230, 255 });
+    }
+
+    UIDraw(FW_REG, "위아래 선택    좌우 조절", x + 16.0f, y + h - 50.0f, 18.0f,
+           (Color){ 130, 145, 175, 255 });
+    UIDraw(FW_REG, "SHIFT 미세    HOME 초기화", x + 16.0f, y + h - 28.0f, 18.0f,
+           (Color){ 130, 145, 175, 255 });
+}
+
+/*----------------------------------------------------------------------------*/
+/* Screens                                                                    */
+/*----------------------------------------------------------------------------*/
+static void DrawTitle(void)
+{
+    /* The name stays Latin - it is the logo, and the pixel face wears it well. */
+    const char *title = "SHOTCOIL";
+    float fs = 98.0f;
+    float tx = SCREEN_W / 2.0f - UIWidth(FW_BOLD, title, fs) * 0.5f;
+    UIDraw(FW_BOLD, title, tx + 5.0f, 145.0f, fs, (Color){ 255, 70, 140, 120 });
+    UIDraw(FW_BOLD, title, tx, 140.0f, fs, RAYWHITE);
+
+    UIDrawC(FW_BOLD, "\"Recoil is The Movement.\"", SCREEN_W / 2.0f, 258.0f, 26.0f,
+            (Color){ 150, 210, 255, 255 });
+
+    /* Three lines, centred. Everything else the game teaches by playing it. */
+    const char *lines[] = {
+        "클릭해서 쏘면 반동으로 날아갑니다!",
+        "바닥이 불타오릅니다. 착지하지 마세요!",
+        "웨이브는 끝나지 않습니다. 끝까지 살아남아보세요"
+    };
+    for (int i = 0; i < 3; i++)
+        UIDrawC(FW_REG, lines[i], SCREEN_W / 2.0f, 340.0f + i * 40.0f, 24.0f,
+                (Color){ 195, 205, 230, 255 });
+
+    float pulse = 0.6f + 0.4f * sinf((float)GetTime() * 4.0f);
+    UIDrawC(FW_BOLD, "클릭  또는  ENTER  로 시작", SCREEN_W / 2.0f, 518.0f, 30.0f,
+            Fade(RAYWHITE, pulse));
+
+    if (bestScore > 0)
+        UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 580.0f,
+                24.0f, (Color){ 255, 225, 120, 255 });
+
+    UIDrawC(FW_REG, "F1  튜닝      F11  창 모드      ESC  종료", SCREEN_W / 2.0f,
+            SCREEN_H - 52.0f, 20.0f, (Color){ 120, 132, 160, 255 });
+}
+
+/* Card geometry, shared by the drawing and the hit-testing so they cannot drift. */
+static Rectangle UpgradeCardRect(int i)
+{
+    const float w = 320.0f, h = 250.0f, gap = 34.0f;
+    float total = 3.0f * w + 2.0f * gap;
+    float x = (SCREEN_W - total) * 0.5f + i * (w + gap);
+    return (Rectangle){ x, SCREEN_H * 0.5f - h * 0.5f + 20.0f, w, h };
+}
+
+static void ApplyUpgrade(int id)
+{
+    if (id < 0 || id >= UP_COUNT) return;
+
+    upStacks[id]++;
+    if (id == UP_VITALITY && player.hp < PlayerMaxHp()) player.hp++;
+
+    EmitBurst(player.pos, 0.0f, PI, 40, 80.0f, 400.0f, 0.8f, 5.0f,
+              UPGRADES[id].color, 40.0f);
+    flashWhite = 0.3f;
+    PlaySfx(&sfxWave, 1.2f);
+}
+
+static void UpdateUpgradeScreen(float dt)
+{
+    upgradeT += dt;
+    if (upgradeT < UPGRADE_FADE) return;    /* not interactive yet */
+
+    Vector2 m = VirtualMouse();
+    int picked = -1;
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (upChoices[i] < 0) continue;
+        if (CheckCollisionPointRec(m, UpgradeCardRect(i)) &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) picked = i;
+    }
+    if (IsKeyPressed(KEY_ONE))   picked = 0;
+    if (IsKeyPressed(KEY_TWO))   picked = 1;
+    if (IsKeyPressed(KEY_THREE)) picked = 2;
+
+    if (picked < 0 || upChoices[picked] < 0) return;
+
+    ApplyUpgrade(upChoices[picked]);
+
+    /* a boss grants two picks - re-roll and stay put for the second */
+    if (--pendingPicks > 0) { RollUpgrades(); upgradeT = 0.0f; return; }
+
+    pendingPicks = 0;
+    StartWave(wave + 1);
+    state = ST_PLAY;
+}
+
+static void DrawUpgradeScreen(void)
+{
+    float a    = Clamp(upgradeT / UPGRADE_FADE, 0.0f, 1.0f);
+    float ease = 1.0f - powf(1.0f - a, 3.0f);
+    float rise = (1.0f - ease) * 34.0f;     /* cards settle upward as they appear */
+    bool  live = (upgradeT >= UPGRADE_FADE);
+
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade((Color){ 6, 8, 18, 255 }, 0.84f * a));
+
+    bool boss = (wave % 5 == 0);
+
+    const char *t = boss ? TextFormat("보스 격파  -  웨이브 %d", wave)
+                         : TextFormat("웨이브 %d 클리어", wave);
+    UIDrawC(FW_BOLD, t, SCREEN_W / 2.0f, 108.0f + rise, 48.0f,
+            Fade(boss ? (Color){ 255, 200, 120, 255 } : RAYWHITE, a));
+
+    const char *s = (pendingPicks > 1) ? TextFormat("강화 선택  (%d회 남음)", pendingPicks)
+                                       : "강화 선택";
+    UIDrawC(FW_REG, s, SCREEN_W / 2.0f, 172.0f + rise, 26.0f,
+            Fade((Color){ 150, 210, 255, 255 }, a));
+
+    Vector2 m = VirtualMouse();
+
+    for (int i = 0; i < 3; i++)
+    {
+        int id = upChoices[i];
+        if (id < 0) continue;
+
+        Rectangle r = UpgradeCardRect(i);
+        r.y += rise;
+
+        const UpgradeDef *u = &UPGRADES[id];
+        bool hot = live && CheckCollisionPointRec(m, r);
+
+        DrawRectangleRec(r, Fade((Color){ 14, 17, 32, 255 }, 0.94f * a));
+        DrawRectangleLinesEx(r, hot ? 3.0f : 2.0f,
+                             Fade(hot ? WHITE : u->color, (hot ? 1.0f : 0.75f) * a));
+        DrawRectangle((int)r.x, (int)r.y, (int)r.width, 6, Fade(u->color, a));
+
+        UIDraw(FW_BOLD, TextFormat("%d", i + 1), r.x + 16.0f, r.y + 20.0f, 24.0f,
+               Fade(WHITE, 0.5f * a));
+        UIDrawC(FW_BOLD, u->name, r.x + r.width / 2.0f, r.y + 62.0f, 36.0f,
+                Fade(u->color, a));
+
+        /* No wrapping: every description is authored to one short line, which
+           is what leaves room for the value line under it. */
+        UIDrawC(FW_REG, u->desc, r.x + r.width / 2.0f, r.y + 108.0f, 22.0f,
+                Fade((Color){ 195, 205, 225, 255 }, a));
+
+        /* Where the stat stands now, and where this card would take it.
+           Same 22 as the description on purpose: sizes snap to whole multiples
+           of the 14px font grid, and 20 falls on the wrong side of that
+           rounding at a 1.0 window scale - it would render at half the size of
+           the line directly above it. */
+        const char *value = UpgradeValue(id);
+        if (value != NULL)
+            UIDrawC(FW_BOLD, value, r.x + r.width / 2.0f, r.y + 142.0f, 22.0f,
+                    Fade(u->color, 0.9f * a));
+
+        /* A capped upgrade counts down to its ceiling, so the hollow pips are
+           the room left. An uncapped one has nothing to count down to - its row
+           just grows with the build, and the number below carries the reading
+           once it runs past what fits on the card. */
+        int owned = upStacks[id];
+        int cap   = u->maxStacks;
+        int pips  = (cap > 0) ? cap : ((owned > 12) ? 12 : owned);
+
+        for (int s2 = 0; s2 < pips; s2++)
+        {
+            int px = (int)(r.x + r.width / 2 - (pips * 16) / 2 + s2 * 16);
+            if (s2 < owned)
+                DrawRectangle(px, (int)r.y + 176, 11, 11, Fade(u->color, a));
+            else
+                DrawRectangleLines(px, (int)r.y + 176, 11, 11,
+                                   Fade(u->color, 0.35f * a));
+        }
+
+        UIDrawC(FW_REG,
+                (cap > 0) ? TextFormat("%d / %d", owned, cap)
+                          : (owned ? TextFormat("보유 %d", owned) : "새 강화"),
+                r.x + r.width / 2.0f, r.y + 200.0f, 20.0f,
+                Fade((Color){ 140, 150, 175, 255 }, a));
+    }
+
+    if (live)
+    {
+        UIDrawC(FW_BOLD, "클릭  또는  1 / 2 / 3", SCREEN_W / 2.0f, SCREEN_H - 72.0f, 24.0f,
+                Fade(RAYWHITE, 0.6f + 0.4f * sinf((float)GetTime() * 4.0f)));
+    }
+}
+
+static void DrawGameOver(void)
+{
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, (Color){ 0, 0, 0, 150 });
+
+    UIDrawC(FW_BOLD, "패배", SCREEN_W / 2.0f, 170.0f, 84.0f,
+            (Color){ 255, 90, 110, 255 });
+
+    UIDrawC(FW_BOLD, TextFormat("점수  %ld", score), SCREEN_W / 2.0f, 300.0f, 42.0f,
+            RAYWHITE);
+
+    UIDrawC(FW_REG, TextFormat("웨이브 %d 도달   -   %.0f초", wave, runTime),
+            SCREEN_W / 2.0f, 356.0f, 24.0f, (Color){ 170, 185, 215, 255 });
+
+    if (newRecord)
+    {
+        float pulse = 0.6f + 0.4f * sinf((float)GetTime() * 6.0f);
+        UIDrawC(FW_BOLD, "신기록!", SCREEN_W / 2.0f, 398.0f, 36.0f,
+                Fade((Color){ 255, 225, 120, 255 }, pulse));
+    }
+    else
+    {
+        UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 400.0f,
+                28.0f, (Color){ 255, 225, 120, 255 });
+    }
+
+    if (gameOverT > 0.5f)
+        UIDrawC(FW_BOLD, "R  다시 시작        ESC  종료", SCREEN_W / 2.0f, 488.0f, 28.0f,
+                Fade(RAYWHITE, 0.6f + 0.4f * sinf((float)GetTime() * 4.0f)));
+}
+
+/*----------------------------------------------------------------------------*/
+/* Main                                                                       */
+/*----------------------------------------------------------------------------*/
+int main(void)
+{
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    InitWindow(SCREEN_W, SCREEN_H, "SHOTCOIL");
+    SetTargetFPS(60);
+    SetExitKey(KEY_NULL);          /* ESC is handled per-screen */
+
+    ToggleBorderlessWindowed();    /* start fullscreen, alt-tab friendly */
+    UpdateViewport();
+    ApplyCursorMode();             /* fullscreen -> lock the pointer in */
+
+    LoadUIFonts();
+    InitSfx();
+
+    tune = TUNE_DEFAULT;
+    InitParams();
+    bestScore = LoadBest();
+    ResetGame();
+    state = ST_TITLE;
+
+    while (!WindowShouldClose())
+    {
+        float rawDt = GetFrameTime();
+        if (rawDt > 1.0f / 30.0f) rawDt = 1.0f / 30.0f;
+
+        UpdateViewport();
+
+        bool toggledView = IsKeyPressed(KEY_F11) ||
+                           (IsKeyDown(KEY_LEFT_ALT) && IsKeyPressed(KEY_ENTER));
+        if (toggledView)
+        {
+            ToggleBorderlessWindowed();
+            fullscreen = !fullscreen;
+            UpdateViewport();
+            ApplyCursorMode();
+        }
+
+        UpdateAimCursor();
+
+        UpdatePanel();
+
+        float dt = rawDt;
+        if (hitstop > 0.0f) { hitstop -= rawDt; dt = 0.0f; }
+
+        /* ---- update ---- */
+        switch (state)
+        {
+            case ST_TITLE:
+                if ((IsKeyPressed(KEY_ENTER) && !toggledView) ||
+                    IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    ResetGame();
+                    state = ST_PLAY;
+                }
+                if (IsKeyPressed(KEY_ESCAPE)) goto quit;
+                break;
+
+            case ST_PLAY:
+                runTime += dt;
+                if (waveBannerT > 0.0f) waveBannerT -= rawDt;
+
+                UpdatePlayer(dt);
+                UpdateEnemies(dt);
+                UpdateBullets(dt);
+                UpdateBeams(rawDt);
+                UpdateShocks(rawDt);
+                UpdatePickups(dt);
+                UpdateSpawning(dt);
+                UpdateParticles(rawDt);
+
+                if (!player.alive && player.deathT > 1.1f) EndRun();
+                if (IsKeyPressed(KEY_ESCAPE)) state = ST_TITLE;
+                break;
+
+            case ST_UPGRADE:
+                UpdateParticles(rawDt);
+                UpdateUpgradeScreen(rawDt);
+                break;
+
+            case ST_GAMEOVER:
+                gameOverT += rawDt;
+                UpdateParticles(rawDt);
+                if (gameOverT > 0.4f && IsKeyPressed(KEY_R)) { ResetGame(); state = ST_PLAY; }
+                if (IsKeyPressed(KEY_ESCAPE)) state = ST_TITLE;
+                break;
+        }
+
+        shake      = fmaxf(0.0f, shake - 60.0f * rawDt);
+        shake     *= powf(0.05f, rawDt);
+        flashWhite = fmaxf(0.0f, flashWhite - 2.5f * rawDt);
+
+        /* ---- draw ---- */
+        BeginDrawing();
+        ClearBackground(BLACK);        /* letterbox bars */
+
+        /* shake lives in real pixels so it stays consistent at any resolution */
+        Vector2 shakeOff = { RandF(-shake, shake) * viewScale,
+                             RandF(-shake, shake) * viewScale };
+
+        BeginScissorMode((int)viewOrigin.x, (int)viewOrigin.y,
+                         (int)(SCREEN_W * viewScale), (int)(SCREEN_H * viewScale));
+
+            BeginMode2D(ViewCamera(shakeOff));
+                DrawBackground();
+                if (state != ST_TITLE)
+                {
+                    DrawGroundHazard();
+                    DrawPickups();
+                    for (int i = 0; i < MAX_ENEMIES; i++)
+                        if (enemies[i].active) DrawEnemy(&enemies[i]);
+                    DrawParticles();
+                    DrawShocks();
+                    DrawBeams();
+                    DrawBullets();
+                    DrawPlayer();
+                    DrawPopups();
+                }
+            EndMode2D();
+
+            /* overlays are not shaken - they must stay readable */
+            BeginMode2D(ViewCamera((Vector2){ 0.0f, 0.0f }));
+                if (flashWhite > 0.0f)
+                    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(RAYWHITE, flashWhite * 0.5f));
+
+                if (state != ST_TITLE) DrawHud();
+                if (state == ST_TITLE)    DrawTitle();
+                if (state == ST_UPGRADE)  DrawUpgradeScreen();
+                if (state == ST_GAMEOVER) DrawGameOver();
+                DrawPanel();
+                DrawCrosshair();
+            EndMode2D();
+
+        EndScissorMode();
+
+        EndDrawing();
+    }
+
+quit:
+    ShutdownSfx();
+    UnloadUIFonts();
+    CloseWindow();
+    return 0;
+}

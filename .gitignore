@@ -1,0 +1,23 @@
+# Visual Studio
+.vs/
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+
+# vcpkg
+vcpkg_installed/
+
+# raylib: 소스와 CMake 빌드 트리는 제외, 산출물(third_party/raylib)은 커밋
+third_party/raylib-6.0/
+third_party/raylib-build/
+
+# 갈무리: 원본 TTF(8MB)는 제외, 산출물(Project1/Project1/galmuri.h)은 커밋.
+# 다시 받는 법은 third_party/make-font.py 상단 주석 참고. 라이선스는 커밋한다.
+third_party/fonts/*.ttf
+
+# 최고점 기록. 실행하면 생기는 개인 기록이라 커밋 대상이 아니다.
+*.sav

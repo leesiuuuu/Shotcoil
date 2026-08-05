@@ -1,0 +1,35 @@
+// Windows resources: the executable's icon and its Properties tab.
+//
+// Explorer shows the icon with the LOWEST numeric id, so this one has to stay
+// at 1 - a named symbol would work too, but only if nothing else ever claims a
+// lower number. shotcoil.ico is generated: python third_party/make-icon.py
+//
+// Kept deliberately ASCII-only. An .rc file has its own encoding rules that do
+// not follow the /utf-8 switch main.c relies on, and a mis-encoded string here
+// shows up as mojibake in the file Properties dialog.
+
+1 ICON "shotcoil.ico"
+
+1 VERSIONINFO
+FILEVERSION     0, 9, 0, 0
+PRODUCTVERSION  0, 9, 0, 0
+FILEOS          0x4L
+FILETYPE        0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"                // en-US, Unicode
+        BEGIN
+            VALUE "FileDescription", "SHOTCOIL - recoil shooter"
+            VALUE "FileVersion",     "0.9.0 beta"
+            VALUE "InternalName",    "shotcoil"
+            VALUE "OriginalFilename","Shotcoil.exe"
+            VALUE "ProductName",     "SHOTCOIL"
+            VALUE "ProductVersion",  "0.9.0 beta"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
