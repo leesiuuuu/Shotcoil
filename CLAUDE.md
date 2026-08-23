@@ -128,7 +128,7 @@
 - [ ] 관성 + 공기저항(미끄러지는 손맛)
 - [ ] 반동 연기 파티클
 - [ ] 탄약 제한 + 착지 시 리로드
-- [ ] **파라미터 5개를 화면에서 실시간 조절 가능하게** (키보드로 값 증감 → 손맛 빠르게 튜닝)
+- [x] ~~파라미터 5개를 화면에서 실시간 조절 가능하게~~ (F1 튜닝 패널 — 손맛 확정 후 제출본에서 제거함)
 
 > 이게 재밌으면 게임 전체가 재밌다. 여기서 파라미터 확정하고 다음으로.
 
@@ -167,6 +167,9 @@ Shotcoil/
 │   ├── raylib/              # 산출물 (커밋됨) — include/, lib/raylib.lib
 │   ├── raylib-6.0/          # 원본 소스 (gitignore)
 │   └── raylib-build/        # CMake 빌드 트리 (gitignore)
+├── packaging/
+│   ├── README.txt           # 심사자용 안내문 (제출물에 동봉)
+│   └── make-dist.ps1        # 빌드 → 수집 → 용량 검사 → zip
 └── CLAUDE.md
 ```
 
@@ -183,8 +186,13 @@ third_party/fonts/           # 원본 Galmuri11.ttf / Galmuri11-Bold.ttf / OFL.t
 `<TargetName>Shotcoil</TargetName>`으로 분리해 둔다 (제출물이 `Project1.exe`면
 곤란하므로 **지우지 말 것**).
 
-현재 **1,196,032 바이트** (제한 1,474,560 — 여유 약 272KB). 이 중 내장 폰트가
-약 50KB, 아이콘 리소스가 약 6KB.
+현재 **1,212,416 바이트** (제한 1,474,560 — 여유 약 256KB). 이 중 내장 폰트가
+약 48KB, 아이콘 리소스가 약 6KB.
+
+제출 패키지는 `packaging/make-dist.ps1`이 만든다. Release를 리빌드하고
+실행파일·안내문·폰트 라이선스를 `dist/Shotcoil/`에 모아 **압축 해제 기준**
+합계를 1,474,560과 대조한 뒤 `dist/Shotcoil.zip`으로 압축한다. 규정이 재는
+값이 압축 후가 아니라 해제 후 크기라서 zip 크기가 아닌 폴더 합계를 검사한다.
 
 `third_party/fonts/`의 원본 TTF와 `make-font.py`는 빌드 시점 도구일 뿐
 실행파일에는 들어가지 않는다 (서브셋 결과인 `galmuri.h`만 컴파일됨).
