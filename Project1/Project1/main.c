@@ -131,7 +131,15 @@ static const WeaponDef WEAPONS[WP_COUNT] = {
       { 210, 140, 255, 255 } },
     { "수류탄",     1.30f, 1.25f, 1, 0.040f, 620.0f,  8.0f, 4.0f, 1.30f, 900.0f, 3, 0, true, false,false, 24.0f,14.0f,
       { 170, 255, 120, 255 } },
-    { "바주카포",   2.80f, 2.70f, 1, 0.010f, 520.0f, 10.0f, 5.0f, 2.50f,   0.0f, 0, 0, true, false,false, 32.0f,17.0f,
+    /* Retuned, because the usual way to die holding this thing was your own
+       recoil. At 2.80 on a 0.86s interval one shot threw you 1290px/s and then
+       took the controls away for most of a second: more than the width of the
+       arena, with no chance to correct before you arrived. Both numbers come
+       down by the same fraction, so the ratio - and with it the sustained
+       thrust the whole roster is tuned against - is unchanged; what shrinks is
+       the per-shot spike (943px/s) and the blind window (0.61s) with it. The
+       rocket flies faster to buy back the reach the shorter fuse costs. */
+    { "바주카포",   2.05f, 1.90f, 1, 0.010f, 660.0f, 10.0f, 4.2f, 2.00f,   0.0f, 0, 0, true, false,false, 32.0f,17.0f,
       { 255, 110, 200, 255 } },
     /* A cone that dies at ~120px. Enormous close-range output, and the tightest
        hover in the game - but you have to be in the crowd to use either.     */
@@ -150,6 +158,11 @@ static const WeaponDef WEAPONS[WP_COUNT] = {
       { 140, 255, 255, 255 } }
 };
 
+/* How long a shot-linked augment ring stays up after firing. Set in FirePlayer,
+   read in DrawAugmentRanges - which is most of the file apart, so it lives up
+   here with the other cosmetic constants rather than beside either one. */
+#define FIRE_RING_TIME 0.30f
+
 #define SWORD_SWING    0.16f
 #define BLAST_RADIUS   115.0f
 #define BEAM_RADIUS    11.0f
@@ -158,7 +171,7 @@ static const WeaponDef WEAPONS[WP_COUNT] = {
 /*----------------------------------------------------------------------------*/
 /* Entities                                                                   */
 /*----------------------------------------------------------------------------*/
-typedef enum GameState { ST_TITLE, ST_PLAY, ST_UPGRADE, ST_GAMEOVER } GameState;
+typedef enum GameState { ST_TITLE, ST_TUTORIAL, ST_PLAY, ST_UPGRADE, ST_GAMEOVER } GameState;
 
 typedef enum EnemyType {
     EN_CHASER, EN_DASHER, EN_RUSHER, EN_SPLITTER, EN_TURRET,
@@ -267,6 +280,11 @@ typedef struct Player {
     int     swingSide;      /* alternates so consecutive slashes mirror */
     float   shieldFlash;    /* AEGIS: counts down after a hit was negated */
     float   blastT;         /* BACKBLAST ring throttle - purely cosmetic      */
+    /* How long the shot-linked augment rings stay up after firing. `muzzle` is
+       0.07s - long enough for a flash, far too short to read a range circle
+       against - so the ring gets its own, slower timer. Only the challenge ring
+       reads it now; DrawAugmentRanges says what happened to the others. */
+    float   fireRingT;
     WeaponType weapon;      /* kept until death */
     float   deathT;
     bool    alive;
@@ -314,7 +332,10 @@ typedef struct Enemy {
 
 /* Dropped items. Kept to a handful so each one reads as an objective worth
    flying to rather than as clutter. */
-typedef enum PickupKind { PK_HEAL, PK_WEAPON } PickupKind;
+/* PK_DAMAGE is the heal crate's twin: same box, same flight to reach it, but
+   it pays into attack power instead of health - so a run at full HP still has
+   a reason to break off and go get one. */
+typedef enum PickupKind { PK_HEAL, PK_WEAPON, PK_DAMAGE } PickupKind;
 
 typedef struct Pickup {
     PickupKind kind;
@@ -378,6 +399,27 @@ typedef struct Popup {
 /*----------------------------------------------------------------------------*/
 static GameState state;
 
+/* Capture mode's three hooks into the simulation. Declared up here because
+   UpdatePlayer needs them and the rest of that machinery lives beside main().
+   The reticle is pinned as well as the trigger - a capture that read the real
+   cursor would render a different picture every time it ran.
+
+   SHOTCOIL_CAPTURE is defined by the Debug|x64 configuration only, so the
+   submitted Release binary contains none of this: no flags, no argv, no dead
+   branches in the two hot functions below. See "Capture mode" near main(). */
+#ifdef SHOTCOIL_CAPTURE
+static bool    shotOn;
+static bool    shotFire;
+static Vector2 shotAim;
+#endif
+
+/* The help page is shown once on the way into the first run of the session and
+   then never forced again - a player who died and wants back in should not have
+   to dismiss a wall of text every time. Deliberately NOT saved to disk: the one
+   thing worth guaranteeing is that a judge opening the exe for the first time
+   sees it, and a stale save file from a test build must not be able to eat it. */
+static bool seenTutorial;
+
 static Player    player;
 static Bullet    bullets[MAX_BULLETS];
 static Enemy     enemies[MAX_ENEMIES];
@@ -389,8 +431,8 @@ static Beam      beams[MAX_BEAMS];
 static Shock     shocks[MAX_SHOCKS];
 #define MAX_PICKUPS 3
 static Pickup    pickups[MAX_PICKUPS];
-static float     healSpawnT, weaponSpawnT;   /* > 0 == a drop is pending */
-static int       lastHealWave, lastWeaponWave;
+static float     healSpawnT, weaponSpawnT, dmgSpawnT;  /* > 0 == a drop is pending */
+static int       lastHealWave, lastWeaponWave, lastDmgWave;
 
 static int   wave;
 static int   spawnQueue[MAX_SPAWNQUEUE];
@@ -514,6 +556,10 @@ static void ApplyCursorMode(void)
 static void UpdateAimCursor(void)
 {
     if (viewScale <= 0.0f) return;
+
+#ifdef SHOTCOIL_CAPTURE
+    if (shotOn) { aimCursor = shotAim; return; }
+#endif
 
     if (cursorLocked)
     {
@@ -684,7 +730,8 @@ typedef enum UpgradeId {
        obvious pick. Kept contiguous at the end of the enum on purpose: that is
        what lets the roll and the card art recognise them without a per-entry
        flag that could drift out of sync with the table. */
-    UP_RICOCHET, UP_DEVOUR, UP_SNIPER, UP_UPDRAFT, UP_COUNT
+    UP_RICOCHET, UP_DEVOUR, UP_SNIPER, UP_UPDRAFT,
+    UP_EXECUTE, UP_FRENZY, UP_FOCUS, UP_MAGNET, UP_COUNT
 } UpgradeId;
 
 #define UP_SPECIAL_FIRST  UP_RICOCHET
@@ -747,7 +794,11 @@ static const UpgradeDef UPGRADES[UP_COUNT] = {
     { "난반사",    "튕길수록 데미지 증가",                1,  16, { 130, 235, 255, 255 } },
     { "포식",      "관통할수록 크고 강해짐",              1,  16, { 255, 150, 210, 255 } },
     { "저격",      "멀리 날아갈수록 강해짐",              1,  16, { 200, 255, 160, 255 } },
-    { "체공",      "오래 떠 있을수록 강해짐",             1,  16, { 255, 210, 140, 255 } }
+    { "체공",      "오래 떠 있을수록 강해짐",             1,  16, { 255, 210, 140, 255 } },
+    { "처형",      "빈사 상태의 적에게 치명타",           1,  16, { 255, 110, 130, 255 } },
+    { "폭주",      "체력이 낮을수록 강해짐",              1,  16, { 255, 140, 100, 255 } },
+    { "일점사",    "같은 적을 연속 명중할수록 강해짐",    1,  16, { 190, 170, 255, 255 } },
+    { "자력탄",    "탄환이 근처 적을 끌어당김",           1,  16, { 140, 220, 200, 255 } }
 };
 
 /* ---- one-time augment tuning ---- */
@@ -765,11 +816,86 @@ static const UpgradeDef UPGRADES[UP_COUNT] = {
 #define UPDRAFT_PER_SEC  0.14f
 #define UPDRAFT_MAX      0.70f
 
+/* EXECUTE is a threshold rather than a curve: a finisher has to be something
+   the player can SEE coming (the enemy is nearly dead) or it is just a random
+   damage roll. Bosses are excluded - a boss dying to a threshold at a third of
+   its bar is not a boss fight. */
+#define EXECUTE_BELOW    0.30f
+#define EXECUTE_MUL      2.60f
+/* FRENZY reads missing health, so it is strongest exactly when a run is about
+   to end. Deliberately a comeback rather than a strategy: you cannot farm it
+   without standing one hit from death. */
+#define FRENZY_PER_HP    0.16f
+/* FOCUS rewards staying on one target while everything else closes in, which
+   is the opposite of what this game usually wants - that tension is the point. */
+#define FOCUS_PER_HIT    0.22f
+#define FOCUS_MAX_HITS   5
+#define FOCUS_TIMEOUT    1.6f
+/* MAGNET pulls enemies toward the shot rather than the shot toward enemies, so
+   unlike HOMING it lands the crowd in one place for the NEXT shot. */
+/* HOMING's search radius. Named because two places need to agree on it: the
+   steering itself and the ring that promises where it will happen. */
+#define HOMING_RANGE     560.0f
+#define MAGNET_RADIUS    150.0f
+#define MAGNET_PULL      520.0f
+
 static int upStacks[UP_COUNT];
 
-/* Waves survived this run. Unlike upStacks this is not a choice - it is the
-   floor under every build, handed out for clearing rather than for picking. */
-static int waveClears;
+/* Earned attack power, in stacks. Unlike upStacks this is not a choice - it is
+   the floor under every build, and three separate things feed it: clearing a
+   wave, opening a damage crate, finishing a challenge. One shared counter so a
+   player only ever has to read one number for "how hard do I hit". */
+static int dmgStacks;
+
+/* Rerolls left this run. A bad hand of three is the one way this game can make
+   a pick feel like a punishment rather than a decision, and the fix has to be
+   scarce or the choice stops mattering at all - so they are spent, not free,
+   and a boss is the only thing that hands one back. */
+static int rerolls;
+
+/* FOCUS: which enemy the player has been hammering, and how many hits in a row
+   have landed on it. Lives here rather than on the bullet because the streak
+   is the PLAYER's, carried across separate shots - that is the whole mechanic. */
+static int   focusEnemy = -1;
+static int   focusHits;
+static float focusTimer;
+
+/* ---- wave challenges ---- */
+/* A goal laid over a wave the player was going to fight anyway. It never costs
+   anything to ignore, which is what lets it ask for something awkward: the
+   whole point is to make a player fly differently for ninety seconds. */
+typedef enum QuestKind {
+    Q_AIRKILL,      /* N kills without touching the floor      */
+    Q_NOHIT,        /* clear the wave untouched                */
+    Q_SPEEDKILL,    /* N kills inside a time limit             */
+    Q_LONGSHOT,     /* N kills from far away                   */
+    Q_COUNT
+} QuestKind;
+
+typedef enum QuestState { QS_NONE, QS_ACTIVE, QS_DONE, QS_FAILED } QuestState;
+
+static QuestKind  questKind;
+static QuestState questState;
+static int        questGoal, questProg;
+/* Two separate numbers on purpose: `questLimit` is what the goal SAYS, and
+   `questTimer` is what is left of it. Reading the countdown back into the goal
+   text made the objective itself appear to shrink every frame. */
+static float      questTimer, questLimit;   /* Q_SPEEDKILL only */
+static float      questFlash;       /* counts down after a state change */
+/* How long a FAILED challenge stays on the HUD before clearing itself. A
+   success is a reward the player may want to look at; a failure is news for
+   about two seconds and a permanent scold after that - nothing can change it,
+   and it would otherwise sit pinned under the score for the rest of the wave. */
+static float      questHold;
+#define QUEST_FAIL_HOLD  2.0f
+#define QUEST_FAIL_FADE  0.5f       /* the tail of the hold, spent fading out */
+
+#define QUEST_EVERY     3           /* one wave in three carries a challenge */
+#define QUEST_LONGSHOT  520.0f      /* what counts as "far" for Q_LONGSHOT   */
+
+#define REROLL_START      2
+#define REROLL_PER_BOSS   1
+#define REROLL_MAX        4
 static int upChoices[3];
 static int   pendingPicks;      /* boss clears grant two picks instead of one */
 static float upgradeT;          /* seconds since the choice screen appeared */
@@ -819,10 +945,36 @@ static float UpGroundTime(void) { return GroundTimeAt(upStacks[UP_ASBESTOS]); }
  * starts falling behind again on purpose. It is a floor, not a substitute for
  * the upgrade cards: by wave 30 it is worth 1.9x, while a single CALIBER stack
  * is 1.25x and they multiply. */
-#define WAVE_DAMAGE_PER  0.03f
-static float WaveDamageMul(void) { return 1.0f + WAVE_DAMAGE_PER * waveClears; }
+#define DMG_PER_STACK    0.03f
+/* What each source is worth. A crate you had to fly to and a challenge you had
+   to play around are both worth more than simply outliving a wave. */
+#define DMG_WAVE_CLEAR   1
+#define DMG_CRATE        2
+#define DMG_QUEST        3
+static float EarnedDamageMul(void) { return 1.0f + DMG_PER_STACK * dmgStacks; }
 
 static bool HasAug(int id) { return upStacks[id] > 0; }
+
+/* FOCUS bookkeeping, called once per DIRECT bullet hit. Kept off the shared
+   damage path on purpose: an explosion touching five enemies would rewrite the
+   target five times a frame and the streak would never survive a rocket. */
+static float FocusOnHit(int enemyIndex)
+{
+    if (!HasAug(UP_FOCUS)) return 1.0f;
+
+    if (enemyIndex == focusEnemy && focusTimer > 0.0f)
+    {
+        if (focusHits < FOCUS_MAX_HITS) focusHits++;
+    }
+    else
+    {
+        focusEnemy = enemyIndex;
+        focusHits  = 0;         /* the first hit only opens the streak */
+    }
+    focusTimer = FOCUS_TIMEOUT;
+
+    return 1.0f + FOCUS_PER_HIT * (float)focusHits;
+}
 
 /* True for the one-time augments, which the enum keeps contiguous at the end
    so this stays a comparison rather than a table lookup. */
@@ -839,11 +991,29 @@ static float UpdraftMul(void)
     return 1.0f + ((g > UPDRAFT_MAX) ? UPDRAFT_MAX : g);
 }
 
+/* FRENZY: every heart already lost is damage. Reads max-minus-current so a
+   VITALITY stack does not silently hand out a bonus for health never taken. */
+static float FrenzyMul(void)
+{
+    if (!HasAug(UP_FRENZY)) return 1.0f;
+    int lost = PlayerMaxHp() - player.hp;
+    return 1.0f + FRENZY_PER_HP * (float)(lost < 0 ? 0 : lost);
+}
+
+/* FOCUS: consecutive hits on one enemy. The streak is applied at the moment a
+   shot lands rather than folded into PlayerDamageMul, because it depends on
+   WHO is being hit - which the muzzle cannot know. */
+static float FocusMul(void)
+{
+    if (!HasAug(UP_FOCUS)) return 1.0f;
+    return 1.0f + FOCUS_PER_HIT * (float)focusHits;
+}
+
 /* Every shot the player fires goes through this - the build, the clears and
-   the airborne bonus multiply rather than any of them replacing another. */
+   the two player-state augments multiply rather than any replacing another. */
 static float PlayerDamageMul(void)
 {
-    return UpDamageMul() * WaveDamageMul() * UpdraftMul();
+    return UpDamageMul() * EarnedDamageMul() * UpdraftMul() * FrenzyMul();
 }
 
 /* SNIPER: scales with how far THIS shot has actually flown. Resolved where the
@@ -933,8 +1103,8 @@ static const char *UpgradeValue(int id)
            what this pick is worth. */
         case UP_CALIBER:
             return TextFormat("공격력 %.0f%% → %.0f%%",
-                              DamageMulAt(n)     * WaveDamageMul() * 100.0f,
-                              DamageMulAt(n + 1) * WaveDamageMul() * 100.0f);
+                              DamageMulAt(n)     * EarnedDamageMul() * 100.0f,
+                              DamageMulAt(n + 1) * EarnedDamageMul() * 100.0f);
         case UP_RECOIL:
             return TextFormat("반동 %.0f%% → %.0f%%",
                               RecoilMulAt(n) * 100.0f, RecoilMulAt(n + 1) * 100.0f);
@@ -1013,6 +1183,16 @@ static const char *UpgradeValue(int id)
         case UP_UPDRAFT:
             return TextFormat("1초당 +%.0f%%   (최대 +%.0f%%)",
                               UPDRAFT_PER_SEC * 100.0f, UPDRAFT_MAX * 100.0f);
+        case UP_EXECUTE:
+            return TextFormat("체력 %.0f%% 이하   피해 %.1f배",
+                              EXECUTE_BELOW * 100.0f, EXECUTE_MUL);
+        case UP_FRENZY:
+            return TextFormat("잃은 체력 1당 +%.0f%%", FRENZY_PER_HP * 100.0f);
+        case UP_FOCUS:
+            return TextFormat("연속 명중마다 +%.0f%%   (최대 %d회)",
+                              FOCUS_PER_HIT * 100.0f, FOCUS_MAX_HITS);
+        case UP_MAGNET:
+            return TextFormat("반경 %.0f 안의 적을 끌어당김", MAGNET_RADIUS);
     }
     return NULL;
 }
@@ -1261,6 +1441,118 @@ static void AddPopupEx(Vector2 pos, int value, const char *label, Color color)
 static void AddPopup(Vector2 pos, int value, Color color)
 {
     AddPopupEx(pos, value, NULL, color);
+}
+
+/* One door for every attack-power gain, so the popup, the sound and the number
+   can never disagree about what a reward was worth. */
+static void GrantDamage(int stacks, Vector2 at, const char *why)
+{
+    dmgStacks += stacks;
+    AddPopupEx(at, 0, why, (Color){ 255, 170, 120, 255 });
+    AddShock(at, 40.0f, (Color){ 255, 170, 120, 255 });
+    PlaySfx(&sfxWave, 1.35f);
+}
+
+/* ---- wave challenges ---- */
+
+static const char *QuestText(void)
+{
+    switch (questKind)
+    {
+        case Q_AIRKILL:   return TextFormat("착지 없이 %d킬", questGoal);
+        case Q_NOHIT:     return "피격 없이 웨이브 클리어";
+        case Q_SPEEDKILL: return TextFormat("%.0f초 안에 %d킬", questLimit, questGoal);
+        /* Phrased against the ring DrawLongshotRange puts on screen, in the
+           same colour. "far" on its own was a number only the source knew. */
+        case Q_LONGSHOT:  return TextFormat("원 밖에서 %d킬", questGoal);
+        default:          return "";
+    }
+}
+
+/* Rolled at the top of a wave. Goals lean on the wave number so a challenge
+   stays roughly as hard to hit at 25 as it was at 4 - the arena is fuller by
+   then, so a flat "6 kills" would quietly turn into a freebie. */
+static void StartQuest(int n)
+{
+    questKind  = (QuestKind)GetRandomValue(0, Q_COUNT - 1);
+    questState = QS_ACTIVE;
+    questProg  = 0;
+    questFlash = 1.4f;
+
+    switch (questKind)
+    {
+        case Q_AIRKILL:   questGoal = 5 + n / 6;  break;
+        case Q_NOHIT:     questGoal = 1;          break;
+        case Q_SPEEDKILL:
+            questGoal  = 6 + n / 5;
+            questLimit = 14.0f;
+            questTimer = questLimit;
+            break;
+        case Q_LONGSHOT:  questGoal = 4 + n / 8;  break;
+        default:          questState = QS_NONE;   break;
+    }
+}
+
+static void QuestSucceed(void)
+{
+    if (questState != QS_ACTIVE) return;
+    questState = QS_DONE;
+    questFlash = 1.6f;
+
+    GrantDamage(DMG_QUEST, (Vector2){ player.pos.x, player.pos.y - 52.0f },
+                TextFormat("도전 성공  공격력 +%.0f%%",
+                           DMG_PER_STACK * DMG_QUEST * 100.0f));
+    flashWhite = 0.25f;
+}
+
+static void QuestFail(void)
+{
+    if (questState != QS_ACTIVE) return;
+    questState = QS_FAILED;
+    questFlash = 1.0f;
+    questHold  = QUEST_FAIL_HOLD;
+}
+
+/* Called from KillEnemy for every kill the player earns. `dist` is how far the
+   killing blow landed from the player, which only Q_LONGSHOT reads. */
+static void QuestOnKill(float dist)
+{
+    if (questState != QS_ACTIVE) return;
+
+    switch (questKind)
+    {
+        /* Airborne only, and UpdatePlayer zeroes the progress on landing - the
+           counter IS the streak rather than a running total. */
+        case Q_AIRKILL:   if (!player.grounded) questProg++; break;
+        case Q_SPEEDKILL: questProg++;                       break;
+        case Q_LONGSHOT:  if (dist > QUEST_LONGSHOT) questProg++; break;
+        default: return;
+    }
+
+    if (questProg >= questGoal) QuestSucceed();
+}
+
+static void UpdateQuest(float dt)
+{
+    if (questFlash > 0.0f) questFlash -= dt;
+
+    /* Failure is self-clearing; QS_NONE is what the rest of the code already
+       treats as "no challenge this wave", so nothing downstream has to learn a
+       new state. Success deliberately does NOT expire. */
+    if (questState == QS_FAILED)
+    {
+        questHold -= dt;
+        if (questHold <= 0.0f) questState = QS_NONE;
+        return;
+    }
+
+    if (questState != QS_ACTIVE) return;
+
+    if (questKind == Q_SPEEDKILL)
+    {
+        questTimer -= dt;
+        if (questTimer <= 0.0f) QuestFail();
+    }
 }
 
 static void UpdateParticles(float dt)
@@ -1659,6 +1951,10 @@ static void ShieldHit(Enemy *e, float dmg, Vector2 from, Color c)
     PlaySfx(&sfxBoom, 1.6f);
 }
 
+/* Kills in one flight before the HUD bothers to say so - 4 is x3.0, the point
+   where touching down actually costs the player something. */
+#define COMBO_HUD_FROM 4
+
 static float ComboMultiplier(void)
 {
     float m = 1.0f + player.combo * 0.5f;
@@ -1792,6 +2088,8 @@ static void KillEnemy(Enemy *e, bool byPlayer)
     /* No-touch combo: every airborne kill stacks the multiplier. */
     if (!player.grounded) { player.combo++; player.comboFlash = 0.45f; }
 
+    QuestOnKill(Vector2Distance(pos, player.pos));
+
     int gained = (int)(payout * ComboMultiplier() * UpScoreMul());
     score += gained;
     AddPopup(pos, gained, c);
@@ -1842,6 +2140,16 @@ static void DamageEnemy(Enemy *e, float dmg, Vector2 from)
        one death. Every caller filters on active already; this just makes the
        invariant impossible to break from a new one. */
     if (!e->active || e->spawnT > 0.0f) return;
+
+    /* EXECUTE: a finisher, applied here rather than at the muzzle so it reads
+       every source - a rocket, a beam and a stray pellet all execute. Bosses
+       are exempt: a boss folding at a third of its bar is not a boss fight. */
+    if (HasAug(UP_EXECUTE) && e->type != EN_BOSS &&
+        e->hp <= e->maxHp * EXECUTE_BELOW)
+    {
+        dmg *= EXECUTE_MUL;
+        AddShock(e->pos, e->radius + 16.0f, (Color){ 255, 110, 130, 255 });
+    }
 
     e->hp -= dmg;
     e->hitFlash = 0.12f;
@@ -1973,7 +2281,8 @@ static void DrawBeams(void)
 
 static Color PickupColor(const Pickup *p)
 {
-    if (p->kind == PK_HEAL) return (Color){ 110, 255, 170, 255 };
+    if (p->kind == PK_HEAL)   return (Color){ 110, 255, 170, 255 };
+    if (p->kind == PK_DAMAGE) return (Color){ 255, 170, 120, 255 };
     return WEAPONS[p->weapon].color;
 }
 
@@ -2015,6 +2324,13 @@ static void GivePickup(const Pickup *p, Vector2 at)
         if (player.hp < PlayerMaxHp()) player.hp++;
         AddPopupEx(at, 0, "체력 +1", c);
     }
+    else if (p->kind == PK_DAMAGE)
+    {
+        /* GrantDamage does its own popup and ring, so this branch only has to
+           hand over the stacks - the shared burst below still fires. */
+        GrantDamage(DMG_CRATE, at,
+                    TextFormat("공격력 +%.0f%%", DMG_PER_STACK * DMG_CRATE * 100.0f));
+    }
     else
     {
         player.weapon = p->weapon;      /* kept until you die */
@@ -2037,6 +2353,11 @@ static void UpdatePickups(float dt)
     {
         weaponSpawnT -= dt;
         if (weaponSpawnT <= 0.0f) SpawnPickup(PK_WEAPON, RandomOtherWeapon());
+    }
+    if (dmgSpawnT > 0.0f)
+    {
+        dmgSpawnT -= dt;
+        if (dmgSpawnT <= 0.0f) SpawnPickup(PK_DAMAGE, WP_PISTOL);
     }
 
     for (int i = 0; i < MAX_PICKUPS; i++)
@@ -2089,6 +2410,12 @@ static void StartWave(int n)
     intermission = (n % 5 == 0) ? 5.0f : 1.2f;
     PlaySfx(&sfxWave, 1.0f);
 
+    /* One wave in three carries a challenge, and never a boss wave - a boss is
+       already asking for the player's whole attention, and a second goal laid
+       over it would only be noise. */
+    if (n >= 3 && n % QUEST_EVERY == 0 && n % 5 != 0) StartQuest(n);
+    else                                              questState = QS_NONE;
+
     /* A pack is offered only when you are actually hurt, and never on
        consecutive waves - otherwise damage stops meaning anything. */
     /* Boss waves always offer one: surviving that far should extend the run,
@@ -2105,6 +2432,16 @@ static void StartWave(int n)
     {
         weaponSpawnT   = 7.0f;
         lastWeaponWave = n;
+    }
+
+    /* Every third wave. Unlike the heal crate this one is not conditional on
+       how the run is going - it is the reward for engaging with the arena, and
+       gating it behind being hurt would mean a clean run gets less for playing
+       better. Dropped late in the wave so it is a detour under pressure. */
+    if (n >= 4 && n - lastDmgWave >= 3)
+    {
+        dmgSpawnT   = 9.0f;
+        lastDmgWave = n;
     }
 
     if (n % 5 == 0)
@@ -2255,13 +2592,23 @@ static void UpdateSpawning(float dt)
             /* Every wave pays out, boss or not. The cards are a choice you can
                get wrong; this is the one reward that just accrues, so a run
                that keeps drawing upgrades it cannot use still gets stronger. */
-            waveClears++;
-            AddPopupEx((Vector2){ player.pos.x, player.pos.y - 30.0f }, 0,
-                       TextFormat("공격력 +%.0f%%", WAVE_DAMAGE_PER * 100.0f),
-                       (Color){ 255, 170, 120, 255 });
+            /* Resolved before the clear bonus so the two popups stack in the
+               order they were earned. */
+            if (questState == QS_ACTIVE && questKind == Q_NOHIT) QuestSucceed();
+
+            GrantDamage(DMG_WAVE_CLEAR,
+                        (Vector2){ player.pos.x, player.pos.y - 30.0f },
+                        TextFormat("공격력 +%.0f%%",
+                                   DMG_PER_STACK * DMG_WAVE_CLEAR * 100.0f));
 
             if (bossWave)
             {
+                if (rerolls < REROLL_MAX)
+                {
+                    rerolls += REROLL_PER_BOSS;
+                    if (rerolls > REROLL_MAX) rerolls = REROLL_MAX;
+                }
+
                 int before = player.hp;
                 player.hp += 2;
                 if (player.hp > PlayerMaxHp()) player.hp = PlayerMaxHp();
@@ -2325,6 +2672,10 @@ static void HurtPlayer(Vector2 from)
     player.hp--;
     player.invuln = 1.3f;
     player.combo  = 0;
+
+    /* Only a hit that actually landed breaks it - an AEGIS negation returns
+       above this line, and it is supposed to mean the hit never happened. */
+    if (questState == QS_ACTIVE && questKind == Q_NOHIT) QuestFail();
 
     Vector2 push = Vector2Subtract(player.pos, from);
     if (Vector2LengthSqr(push) < 0.001f) push = (Vector2){ 0, -1 };
@@ -2472,8 +2823,9 @@ static void FirePlayer(Vector2 target)
         }
     }
 
-    player.cooldown = tune.fireCooldown * w->cooldownMul * UpFireMul();
-    player.muzzle   = 0.07f;
+    player.cooldown  = tune.fireCooldown * w->cooldownMul * UpFireMul();
+    player.muzzle    = 0.07f;
+    player.fireRingT = FIRE_RING_TIME;
     player.grounded = false;
 
     if (w->slash)   /* mirror each swing so repeated slashes read as a combo */
@@ -2510,13 +2862,25 @@ static void UpdatePlayer(float dt)
     if (player.swingT   > 0.0f) player.swingT   -= dt;
     if (player.shieldFlash > 0.0f) player.shieldFlash -= dt;
     if (player.blastT   > 0.0f) player.blastT   -= dt;
+    if (player.fireRingT > 0.0f) player.fireRingT -= dt;
     if (player.comboFlash > 0.0f) player.comboFlash -= dt;
+
+    /* Let go of the target if nothing has landed on it recently. */
+    if (focusTimer > 0.0f)
+    {
+        focusTimer -= dt;
+        if (focusTimer <= 0.0f) { focusEnemy = -1; focusHits = 0; }
+    }
 
     player.blinkTimer -= dt;
     if (player.blinkTimer < -0.12f) player.blinkTimer = RandF(2.0f, 5.0f);
 
     /* Ammo is infinite - the fire interval alone rations how much you can fly. */
+#ifdef SHOTCOIL_CAPTURE
+    if ((IsMouseButtonDown(MOUSE_BUTTON_LEFT) || shotFire) && player.cooldown <= 0.0f)
+#else
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && player.cooldown <= 0.0f)
+#endif
         FirePlayer(mouse);
 
     /* Integration */
@@ -2575,6 +2939,12 @@ static void UpdatePlayer(float dt)
     {
         player.airTime = 0.0f;
         if (!wasGrounded && player.combo > 0) player.combo = 0;   /* touching down burns the combo */
+
+        /* Same rule for the airborne challenge: the counter is a streak, and
+           the floor is what ends it. Not a failure though - you can start the
+           streak again as long as the wave is still running. */
+        if (!wasGrounded && questState == QS_ACTIVE && questKind == Q_AIRKILL)
+            questProg = 0;
     }
     else player.airTime += dt;
 
@@ -3445,7 +3815,7 @@ static void UpdateBullets(float dt)
         if (b->fromPlayer && !b->slash && upStacks[UP_HOMING] > 0)
         {
             float  speed = Vector2Length(b->vel);
-            Enemy *t     = (speed > 1.0f) ? NearestEnemy(b->pos, 560.0f) : NULL;
+            Enemy *t     = (speed > 1.0f) ? NearestEnemy(b->pos, HOMING_RANGE) : NULL;
 
             if (t != NULL)
             {
@@ -3457,6 +3827,29 @@ static void UpdateBullets(float dt)
                 Vector2 mix = Vector2Lerp(cur, want, k);
                 if (Vector2LengthSqr(mix) > 0.0001f)
                     b->vel = Vector2Scale(Vector2Normalize(mix), speed);
+            }
+        }
+
+        /* MAGNET: the shot drags the crowd toward itself. Unlike HOMING this
+           does not improve the shot in flight - it rearranges the arena for the
+           NEXT one, which is what makes it worth a slot next to a damage card.
+           Nudges position rather than velocity because half the roster steers
+           by writing pos directly and would simply undo a velocity change. */
+        if (b->fromPlayer && !b->slash && HasAug(UP_MAGNET))
+        {
+            for (int j = 0; j < MAX_ENEMIES; j++)
+            {
+                Enemy *e = &enemies[j];
+                if (!e->active || e->spawnT > 0.0f || e->type == EN_BOSS) continue;
+
+                Vector2 d   = Vector2Subtract(b->pos, e->pos);
+                float   len = Vector2Length(d);
+                if (len > MAGNET_RADIUS || len < 1.0f) continue;
+
+                /* Strongest at the centre, nothing at the rim, so a bullet
+                   passing by nudges rather than snatches. */
+                float pull = (1.0f - len / MAGNET_RADIUS) * MAGNET_PULL * dt;
+                e->pos = Vector2Add(e->pos, Vector2Scale(d, pull / len));
             }
         }
 
@@ -3537,7 +3930,7 @@ static void UpdateBullets(float dt)
                     break;
                 }
 
-                DamageEnemy(e, BulletDamage(b), b->pos);
+                DamageEnemy(e, BulletDamage(b) * FocusOnHit(j), b->pos);
 
                 /* A piercing shot carries on, but remembers who it just went
                    through so one pass can never land as two hits. */
@@ -3627,13 +4020,22 @@ static void ResetGame(void)
 
     /* upgrades are run-scoped: dying wipes the build, same as the weapon */
     memset(upStacks, 0, sizeof(upStacks));
-    waveClears   = 0;
+    dmgStacks    = 0;
+    rerolls      = REROLL_START;
+    questState   = QS_NONE;
+    questFlash   = 0.0f;
+    questHold    = 0.0f;
+    focusEnemy   = -1;
+    focusHits    = 0;
+    focusTimer   = 0.0f;
     blastDepth   = 0;
     pendingPicks = 0;
     healSpawnT     = 0.0f;
     weaponSpawnT   = 0.0f;
+    dmgSpawnT      = 0.0f;
     lastHealWave   = -1;
     lastWeaponWave = -1;
+    lastDmgWave    = -1;
 
     memset(&player, 0, sizeof(player));
     player.pos     = (Vector2){ SCREEN_W / 2.0f, GROUND_Y - 120.0f };
@@ -3767,38 +4169,45 @@ static void DrawStareEyes(Vector2 pos, Vector2 look, float forward, float spacin
     }
 }
 
-static void DrawPickups(void)
+/* One crate, drawn from its centre, with no state of its own.
+ *
+ * Split out of DrawPickups because the help screen shows the same three boxes:
+ * a hand-drawn second copy would be a lie waiting to happen the first time an
+ * icon changes, and the whole value of the page is that the shape a player
+ * memorised there is the shape that drops into the arena. */
+static void DrawCrate(Vector2 p, float rot, PickupKind kind, WeaponType weapon, Color c)
 {
-    for (int i = 0; i < MAX_PICKUPS; i++)
+    Color ink = (Color){ 22, 28, 34, 255 };
+
+    DrawRectanglePro((Rectangle){ p.x, p.y, 32.0f, 32.0f }, (Vector2){ 16.0f, 16.0f },
+                     rot, WHITE);
+    DrawRectanglePro((Rectangle){ p.x, p.y, 27.0f, 27.0f }, (Vector2){ 13.5f, 13.5f },
+                     rot, c);
+
+    if (kind == PK_HEAL)            /* a cross */
     {
-        const Pickup *pk = &pickups[i];
-        if (!pk->active) continue;
+        DrawRectanglePro((Rectangle){ p.x, p.y, 15.0f, 5.0f },
+                         (Vector2){ 7.5f, 2.5f }, rot, ink);
+        DrawRectanglePro((Rectangle){ p.x, p.y, 5.0f, 15.0f },
+                         (Vector2){ 2.5f, 7.5f }, rot, ink);
+        return;
+    }
 
-        /* blink out the last three seconds so vanishing is never a surprise */
-        if (pk->life < 3.0f && fmodf(pk->life, 0.3f) < 0.15f) continue;
-
-        Vector2 p    = { pk->pos.x, pk->pos.y + sinf(pk->bob) * 5.0f };
-        Color   c    = PickupColor(pk);
-        Color   ink  = (Color){ 22, 28, 34, 255 };
-        float   rot  = sinf(pk->bob) * 6.0f;
-        float   glow = 0.85f + 0.15f * sinf(pk->bob * 2.0f);
-
-        DrawCircleGradient(p, 46.0f * glow, Fade(c, 0.28f), Fade(c, 0.0f));
-        DrawRectanglePro((Rectangle){ p.x, p.y, 32.0f, 32.0f }, (Vector2){ 16.0f, 16.0f },
-                         rot, WHITE);
-        DrawRectanglePro((Rectangle){ p.x, p.y, 27.0f, 27.0f }, (Vector2){ 13.5f, 13.5f },
-                         rot, c);
-
-        if (pk->kind == PK_HEAL)        /* a cross */
+    if (kind == PK_DAMAGE)          /* two stacked chevrons, pointing up */
+    {
+        for (int k = 0; k < 2; k++)
         {
-            DrawRectanglePro((Rectangle){ p.x, p.y, 15.0f, 5.0f },
-                             (Vector2){ 7.5f, 2.5f }, rot, ink);
-            DrawRectanglePro((Rectangle){ p.x, p.y, 5.0f, 15.0f },
-                             (Vector2){ 2.5f, 7.5f }, rot, ink);
-            continue;
+            float oy = p.y + 4.0f + k * 7.0f;
+            DrawRectanglePro((Rectangle){ p.x - 4.0f, oy, 11.0f, 4.0f },
+                             (Vector2){ 5.5f, 2.0f }, rot - 40.0f, ink);
+            DrawRectanglePro((Rectangle){ p.x + 4.0f, oy, 11.0f, 4.0f },
+                             (Vector2){ 5.5f, 2.0f }, rot + 40.0f, ink);
         }
+        return;
+    }
 
-        switch (pk->weapon)
+    {
+        switch (weapon)
         {
             case WP_SMG:        /* thin barrel over a stubby magazine */
                 DrawRectanglePro((Rectangle){ p.x, p.y - 3.0f, 18.0f, 4.0f },
@@ -3871,6 +4280,25 @@ static void DrawPickups(void)
 
             default: break;
         }
+    }
+}
+
+static void DrawPickups(void)
+{
+    for (int i = 0; i < MAX_PICKUPS; i++)
+    {
+        const Pickup *pk = &pickups[i];
+        if (!pk->active) continue;
+
+        /* blink out the last three seconds so vanishing is never a surprise */
+        if (pk->life < 3.0f && fmodf(pk->life, 0.3f) < 0.15f) continue;
+
+        Vector2 p    = { pk->pos.x, pk->pos.y + sinf(pk->bob) * 5.0f };
+        Color   c    = PickupColor(pk);
+        float   glow = 0.85f + 0.15f * sinf(pk->bob * 2.0f);
+
+        DrawCircleGradient(p, 46.0f * glow, Fade(c, 0.28f), Fade(c, 0.0f));
+        DrawCrate(p, sinf(pk->bob) * 6.0f, pk->kind, pk->weapon, c);
     }
 }
 
@@ -4236,6 +4664,152 @@ static void DrawEnemy(const Enemy *e)
     }
 }
 
+/*----------------------------------------------------------------------------*/
+/* Augment ranges                                                             */
+/*                                                                            */
+/* Several augments are worth exactly as much as the player's ability to judge */
+/* a distance by eye, which nobody can do from a number on a card. So the ones */
+/* with a radius draw it. Dashed rather than solid, and faint until you fire - */
+/* the arena has enough solid circles in it already, and a permanent bright    */
+/* ring would read as a hazard.                                               */
+/*----------------------------------------------------------------------------*/
+
+/* A dashed circle. Segments are drawn as short arcs with gaps between them,
+   which keeps a 846-radius ring legible without it turning into a wall. */
+static void DrawDashedRing(Vector2 c, float r, Color col, int dashes, float thick)
+{
+    if (r < 4.0f) return;
+
+    float step = 360.0f / (float)dashes;
+    for (int i = 0; i < dashes; i++)
+    {
+        float a0 = i * step;
+        DrawRing(c, r - thick * 0.5f, r + thick * 0.5f, a0, a0 + step * 0.5f, 6, col);
+    }
+}
+
+/* Which augment ranges are worth drawing, and when.
+ *
+ * Every one of these used to be a faint circle pinned to the player at all
+ * times. Four augments deep that is four concentric dashed rings and four
+ * labels following you around a fight you are supposed to be reading. Almost
+ * none survived the only question that matters here - what does the player DO
+ * differently for having seen it?
+ *
+ *   BACKBLAST, DEATHBLAST - both already throw a shock ring of exactly the
+ *      right size at exactly the right place the instant they fire. A standing
+ *      copy on the player is the same fact twice, and the wrong one is the one
+ *      that is always on.
+ *
+ *   HOMING - the shot visibly bends. That IS the feedback. The ring answered
+ *      "will this curve?" with a 560px circle, which from anywhere near the
+ *      middle of the arena means yes to nearly everything on screen - and the
+ *      answer never moved the crosshair, because you were aiming at the enemy
+ *      either way.
+ *
+ *   SNIPER - worse. 846px is further than the screen's own corner is from the
+ *      middle, so the ring was either entirely invisible or a giant arc cutting
+ *      across the fight. And the bonus is a smooth gradient: the circle marked
+ *      the one distance where the reward STOPS growing, which is not a decision
+ *      anybody makes.
+ *
+ * What is left is the two that still answer something - a reach small enough to
+ * aim with, and a target you can kill right now.
+ */
+static void DrawAugmentRanges(void)
+{
+    if (!player.alive) return;
+
+    /* MAGNET travels with the shot, so its ring does too. One per live bullet
+       was a carpet of circles on anything with an SMG's fire rate, so a ring is
+       drawn only while its bullet actually has something to pull: the moment it
+       means anything is the moment it is doing something. */
+    if (HasAug(UP_MAGNET))
+    {
+        for (int i = 0; i < MAX_BULLETS; i++)
+        {
+            const Bullet *b = &bullets[i];
+            if (!b->active || !b->fromPlayer || b->slash) continue;
+
+            bool pulling = false;
+            for (int j = 0; j < MAX_ENEMIES && !pulling; j++)
+            {
+                const Enemy *e = &enemies[j];
+                if (!e->active || e->spawnT > 0.0f) continue;
+                if (Vector2Distance(e->pos, b->pos) <= MAGNET_RADIUS + e->radius)
+                    pulling = true;
+            }
+            if (!pulling) continue;
+
+            DrawDashedRing(b->pos, MAGNET_RADIUS,
+                           Fade((Color){ 140, 220, 200, 255 }, 0.30f), 18, 1.5f);
+        }
+    }
+
+    /* EXECUTE is a threshold, not a radius - so it marks the enemies that are
+       inside it. Kept always-on: unlike the others this one is not describing
+       the player, it is answering "which of these dies to the next shot", and
+       that is a question the player is asking constantly. */
+    if (HasAug(UP_EXECUTE))
+    {
+        float pulse = 0.45f + 0.25f * sinf((float)GetTime() * 7.0f);
+        for (int i = 0; i < MAX_ENEMIES; i++)
+        {
+            const Enemy *e = &enemies[i];
+            if (!e->active || e->spawnT > 0.0f || e->type == EN_BOSS) continue;
+            if (e->hp > e->maxHp * EXECUTE_BELOW) continue;
+
+            DrawDashedRing(e->pos, e->radius + 9.0f,
+                           Fade((Color){ 255, 110, 130, 255 }, pulse), 10, 2.0f);
+        }
+    }
+}
+
+/* The reach a "먼 거리" challenge is actually asking for.
+ *
+ * Q_LONGSHOT is the only goal in the game phrased as a distance, and nothing on
+ * screen ever said what "far" meant - QUEST_LONGSHOT is 520px, which a player
+ * can only discover by killing things and watching whether the counter moves.
+ * So the threshold gets drawn, in the HUD challenge block's own colour so the
+ * ring and the objective read as one thing.
+ *
+ * Inverted against every other ring in this game: here the kills that count are
+ * the ones OUTSIDE it. That is what the outward ticks and the label are for - a
+ * plain circle would be read as "get inside this", which is exactly backwards.
+ *
+ * Only while the challenge is live. Once it is won or lost the distance stops
+ * meaning anything, and a ring this size is far too big to leave lying around. */
+static void DrawLongshotRange(void)
+{
+    if (!player.alive) return;
+    if (questState != QS_ACTIVE || questKind != Q_LONGSHOT) return;
+
+    const Color c = { 150, 210, 255, 255 };
+    const float r = QUEST_LONGSHOT;
+
+    /* Brighter than the augment rings on purpose: those are passive stats, this
+       is a goal the player is actively chasing. Still lifts while firing. */
+    float a = 0.34f + 0.18f * Clamp(player.fireRingT / FIRE_RING_TIME, 0.0f, 1.0f);
+
+    DrawDashedRing(player.pos, r, Fade(c, a), 44, 2.0f);
+
+    /* Ticks on the far side of the line, pointing away. Cheap, and it is the
+       whole reason the ring cannot be mistaken for a containment circle. */
+    for (int i = 0; i < 22; i++)
+    {
+        float   ang = (float)i * (2.0f * PI / 22.0f);
+        Vector2 in  = Vector2Add(player.pos, FromAngle(ang, r + 3.0f));
+        Vector2 out = Vector2Add(player.pos, FromAngle(ang, r + 11.0f));
+        DrawLineEx(in, out, 2.0f, Fade(c, a * 0.85f));
+    }
+
+    /* No label on the ring itself. A 520px circle is wider than the arena from
+       most positions, so the only spots a label fits are the screen edges -
+       which is exactly where the score, the hearts and the weapon readout all
+       live, and it landed on one of them depending on where the player happened
+       to be floating. The objective line in the HUD names the ring instead. */
+}
+
 static void DrawPlayer(void)
 {
     if (!player.alive) return;
@@ -4494,6 +5068,70 @@ static void DrawHud(void)
     UIDraw(FW_REG, TextFormat("최고 %ld", bestScore), 26.0f, 64.0f, 20.0f,
            (Color){ 160, 170, 200, 255 });
 
+    /* ---- wave challenge ---- */
+    /* Under the score, because it is the other number the run is chasing. A
+       finished one stays on screen for the rest of the wave rather than
+       vanishing on completion - the reward popup is easy to miss mid-fight, and
+       a goal that disappears the moment you hit it reads as a bug. */
+    if (questState != QS_NONE)
+    {
+        /* A state change pulses the whole block once, which is what carries
+           "you just did that" without needing a second banner. */
+        float pulse = (questFlash > 0.0f) ? 0.35f * sinf(questFlash * 18.0f) : 0.0f;
+
+        /* A failed block dims away instead of blinking out - vanishing on a
+           frame boundary reads as a glitch rather than as a timer expiring. */
+        float gone = (questState == QS_FAILED)
+                   ? Clamp(questHold / QUEST_FAIL_FADE, 0.0f, 1.0f) : 1.0f;
+
+        Color c = (questState == QS_DONE)   ? (Color){ 255, 190, 130, 255 }
+                : (questState == QS_FAILED) ? (Color){ 130, 138, 158, 255 }
+                                            : (Color){ 150, 210, 255, 255 };
+
+        const char *tag = (questState == QS_DONE)   ? "도전 성공"
+                        : (questState == QS_FAILED) ? "도전 실패"
+                                                    : "도전";
+
+        UIDraw(FW_BOLD, tag, 26.0f, 100.0f, 20.0f, Fade(c, (0.85f + pulse) * gone));
+
+        /* What the challenge is WORTH, stated next to what it is. The payout
+           used to exist only as a popup at the moment it landed - one second,
+           mid-fight, over the player's own explosion - so the honest reading of
+           an active challenge was "some reward, probably". A goal you can see
+           the price tag on is a goal you can decide to chase or ignore. */
+        {
+            const char *verb = (questState == QS_DONE)   ? "획득"
+                             : (questState == QS_FAILED) ? "놓침"
+                                                         : "보상";
+            const char *pay  = TextFormat("%s  공격력 +%.0f%%", verb,
+                                          DMG_PER_STACK * DMG_QUEST * 100.0f);
+            UIDraw(FW_REG, pay, 26.0f + UIWidth(FW_BOLD, tag, 20.0f) + 14.0f,
+                   100.0f, 20.0f, Fade(c, (0.7f + pulse) * gone));
+        }
+
+        UIDraw(FW_REG, QuestText(), 26.0f, 124.0f, 22.0f,
+               Fade(questState == QS_ACTIVE ? (Color){ 205, 215, 235, 255 }
+                                            : c, (0.9f + pulse) * gone));
+
+        /* Progress only means something while it can still change, and only for
+           the goals that actually count something. */
+        if (questState == QS_ACTIVE && questKind != Q_NOHIT)
+        {
+            float f = (float)questProg / (float)questGoal;
+            if (f > 1.0f) f = 1.0f;
+
+            DrawRectangle(26, 154, 190, 6, Fade((Color){ 70, 80, 105, 255 }, 0.9f));
+            DrawRectangle(26, 154, (int)(190.0f * f), 6, Fade(c, 0.95f));
+            UIDraw(FW_BOLD, TextFormat("%d / %d", questProg, questGoal),
+                   224.0f, 146.0f, 20.0f, Fade(c, 0.95f));
+        }
+
+        /* The clock is the threat on this one, so it gets its own line. */
+        if (questState == QS_ACTIVE && questKind == Q_SPEEDKILL)
+            UIDraw(FW_BOLD, TextFormat("%.1f초", questTimer), 26.0f, 168.0f, 20.0f,
+                   Fade(questTimer < 4.0f ? (Color){ 255, 120, 120, 255 } : c, 0.95f));
+    }
+
     UIDrawC(FW_BOLD, TextFormat("웨이브 %d", wave), SCREEN_W / 2.0f, 18.0f, 28.0f,
             (Color){ 200, 215, 255, 255 });
 
@@ -4528,7 +5166,12 @@ static void DrawHud(void)
                24.0f, SCREEN_H - 38.0f, 28.0f, (Color){ 255, 190, 130, 255 });
     }
 
-    if (player.combo > 0)
+    /* The multiplier already floats over the player's head, popping on every
+       kill - that is the feedback. This line is the standing reminder not to
+       land, so it only earns its place once there is something worth losing.
+       Below the threshold the two readouts were the same number twice, and one
+       of them was on screen for most of the game. */
+    if (player.combo >= COMBO_HUD_FROM)
     {
         UIDrawC(FW_BOLD, TextFormat("무착지 콤보  x%.1f", ComboMultiplier()),
                 SCREEN_W / 2.0f, SCREEN_H - 44.0f, 24.0f,
@@ -4588,8 +5231,113 @@ static void DrawTitle(void)
         UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 580.0f,
                 24.0f, (Color){ 255, 225, 120, 255 });
 
-    UIDrawC(FW_REG, "F11  창 모드      ESC  종료", SCREEN_W / 2.0f,
-            SCREEN_H - 52.0f, 20.0f, (Color){ 120, 132, 160, 255 });
+    UIDrawC(FW_REG, "T  게임 방법      F11  창 모드      ESC  종료",
+            SCREEN_W / 2.0f, SCREEN_H - 52.0f, 20.0f, (Color){ 120, 132, 160, 255 });
+}
+
+/* The help page.
+ *
+ * Only two things in this game cannot be learned by playing it. The crates are
+ * gone in fourteen seconds, so guessing wrong about one costs a detour under
+ * fire; and the screen between waves asks for a decision using words the fight
+ * never said out loud. Recoil, the floor and the enemies teach themselves in
+ * the first ten seconds, so they are deliberately not on this page - a wall of
+ * text that explains what the player is about to feel is worse than nothing.
+ *
+ * Everything here is drawn at sizes that survive UISize's 14px grid at a 1.0
+ * window scale, where 20 and 22 land two whole steps apart. Lines are kept
+ * short for the same reason: at that scale a body line renders at 28 virtual
+ * pixels, and a sentence that fits the panel in fullscreen may not fit here. */
+static void DrawTutorial(void)
+{
+    const Color dim  = (Color){ 150, 162, 190, 255 };
+    const Color body = (Color){ 200, 210, 232, 255 };
+    const Color cyan = (Color){ 150, 210, 255, 255 };
+
+    /* Same scrim the upgrade screen uses. Without it the arena's floor line
+       runs straight through the bottom hint - the background is drawn under
+       every state, and this page is the only one whose text reaches that low. */
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade((Color){ 6, 8, 18, 255 }, 0.88f));
+
+    UIDrawC(FW_BOLD, "게임 방법", SCREEN_W / 2.0f, 34.0f, 44.0f, RAYWHITE);
+    UIDrawC(FW_REG, "좌클릭으로 발사  -  조준한 반대 방향으로 날아갑니다",
+            SCREEN_W / 2.0f, 96.0f, 24.0f, cyan);
+    UIDrawC(FW_REG, "바닥에 오래 머무르면 불타오릅니다",
+            SCREEN_W / 2.0f, 130.0f, 24.0f, body);
+
+    /* ---- crates ---- */
+    Rectangle a = { 140.0f, 178.0f, 1000.0f, 204.0f };
+    DrawRectangleRec(a, Fade((Color){ 14, 17, 32, 255 }, 0.92f));
+    DrawRectangleLinesEx(a, 2.0f, Fade((Color){ 255, 205, 120, 255 }, 0.55f));
+
+    UIDraw(FW_BOLD, "상자", a.x + 32.0f, a.y + 18.0f, 30.0f,
+           (Color){ 255, 205, 120, 255 });
+    {
+        const char *note = "잠시 뒤 사라집니다  -  몸으로 부딪혀 줍시다";
+        UIDraw(FW_REG, note, a.x + a.width - 32.0f - UIWidth(FW_REG, note, 20.0f),
+               a.y + 26.0f, 20.0f, dim);
+    }
+
+    /* Drawn through the same DrawCrate the arena uses, at the same 32px, so
+       what is memorised here is literally the sprite that will drop. */
+    {
+        const PickupKind kinds[3] = { PK_HEAL, PK_WEAPON, PK_DAMAGE };
+        /* The shotgun stands in for "a weapon": its double barrel is the most
+           legible of the eleven icons at a glance. */
+        const WeaponType gun      = WP_SHOTGUN;
+        const char      *names[3] = { "체력 상자", "무기 상자", "공격력 상자" };
+        const char      *desc[3]  = {
+            "체력을 1 회복합니다",
+            "무기가 바뀍니다  -  죽을 때까지 유지됩니다",
+            "공격력이 영구히 오릅니다"
+        };
+        Color colors[3] = { (Color){ 110, 255, 170, 255 },
+                            WEAPONS[gun].color,
+                            (Color){ 255, 170, 120, 255 } };
+
+        for (int i = 0; i < 3; i++)
+        {
+            float y = a.y + 66.0f + i * 46.0f;
+
+            DrawCrate((Vector2){ a.x + 58.0f, y + 14.0f }, 0.0f, kinds[i], gun, colors[i]);
+
+            UIDraw(FW_BOLD, names[i], a.x + 96.0f, y, 22.0f, colors[i]);
+            UIDraw(FW_REG, desc[i],
+                   a.x + 96.0f + UIWidth(FW_BOLD, names[i], 22.0f) + 20.0f, y, 22.0f,
+                   body);
+        }
+    }
+
+    /* ---- upgrades ---- */
+    Rectangle b = { 140.0f, 398.0f, 1000.0f, 208.0f };
+    DrawRectangleRec(b, Fade((Color){ 14, 17, 32, 255 }, 0.92f));
+    DrawRectangleLinesEx(b, 2.0f, Fade(cyan, 0.55f));
+
+    UIDraw(FW_BOLD, "강화와 새로고침", b.x + 32.0f, b.y + 18.0f, 30.0f, cyan);
+
+    {
+        const char *lines[4] = {
+            "웨이브를 클리어하면 강화 3장 중 1장을 고릅니다  (보스는 2장)",
+            "'특수 증강'은 한 번만 얻는 특별한 강화입니다",
+            "새로고침  -  R 키로 3장을 다시 뽑습니다",
+            "새로고침 횟수  -  시작 2회, 보스 처치마다 +1  (최대 4회)"
+        };
+        for (int i = 0; i < 4; i++)
+            UIDraw(FW_REG, lines[i], b.x + 40.0f, b.y + 64.0f + i * 34.0f, 22.0f, body);
+    }
+
+    float pulse = 0.6f + 0.4f * sinf((float)GetTime() * 4.0f);
+    UIDrawC(FW_BOLD, "클릭  또는  ENTER  로 시작", SCREEN_W / 2.0f, 630.0f, 28.0f,
+            Fade(RAYWHITE, pulse));
+    UIDrawC(FW_REG, "ESC  타이틀로", SCREEN_W / 2.0f, 676.0f, 20.0f, dim);
+}
+
+/* Button geometry, shared by the drawing and the hit-testing so they cannot
+   drift. Sits under the middle card, where the eye already is. */
+static Rectangle RerollButtonRect(void)
+{
+    const float w = 300.0f, h = 52.0f;
+    return (Rectangle){ SCREEN_W / 2.0f - w / 2.0f, SCREEN_H - 122.0f, w, h };
 }
 
 /* Card geometry, shared by the drawing and the hit-testing so they cannot drift. */
@@ -4631,6 +5379,24 @@ static void UpdateUpgradeScreen(float dt)
     if (IsKeyPressed(KEY_ONE))   picked = 0;
     if (IsKeyPressed(KEY_TWO))   picked = 1;
     if (IsKeyPressed(KEY_THREE)) picked = 2;
+
+    /* Reroll before the pick is resolved, so a hand can be thrown away without
+       spending the pick it came with. Does NOT reset upgradeT: the cards should
+       swap in place rather than replay the whole entrance animation, which at
+       four rerolls in a row would be most of the time spent here. */
+    bool wantReroll = IsKeyPressed(KEY_R) ||
+                      (CheckCollisionPointRec(m, RerollButtonRect()) &&
+                       IsMouseButtonPressed(MOUSE_BUTTON_LEFT));
+
+    if (wantReroll && rerolls > 0)
+    {
+        rerolls--;
+        RollUpgrades();
+        EmitBurst(player.pos, 0.0f, PI, 22, 60.0f, 260.0f, 0.5f, 4.0f,
+                  (Color){ 150, 210, 255, 255 }, 30.0f);
+        PlaySfx(&sfxReload, 1.1f);
+        return;
+    }
 
     if (picked < 0 || upChoices[picked] < 0) return;
 
@@ -4749,7 +5515,22 @@ static void DrawUpgradeScreen(void)
 
     if (live)
     {
-        UIDrawC(FW_BOLD, "클릭  또는  1 / 2 / 3", SCREEN_W / 2.0f, SCREEN_H - 72.0f, 24.0f,
+        /* ---- reroll ---- */
+        Rectangle rb  = RerollButtonRect();
+        bool      can = (rerolls > 0);
+        bool      hot = can && CheckCollisionPointRec(m, rb);
+        Color     rc  = can ? (Color){ 150, 210, 255, 255 } : (Color){ 110, 118, 140, 255 };
+
+        DrawRectangleRec(rb, Fade(hot ? (Color){ 30, 48, 74, 255 }
+                                      : (Color){ 14, 17, 32, 255 }, 0.94f * a));
+        DrawRectangleLinesEx(rb, hot ? 3.0f : 2.0f, Fade(rc, (hot ? 1.0f : 0.6f) * a));
+
+        /* The count is the whole decision here, so it is stated rather than
+           implied by a greyed-out button - "R  새로고침  2" reads at a glance. */
+        UIDrawC(FW_BOLD, can ? TextFormat("R   새로고침   %d", rerolls) : "R   새로고침   없음",
+                rb.x + rb.width / 2.0f, rb.y + 13.0f, 26.0f, Fade(rc, a));
+
+        UIDrawC(FW_BOLD, "클릭  또는  1 / 2 / 3", SCREEN_W / 2.0f, SCREEN_H - 56.0f, 24.0f,
                 Fade(RAYWHITE, 0.6f + 0.4f * sinf((float)GetTime() * 4.0f)));
     }
 }
@@ -4783,7 +5564,7 @@ static float DrawFinalSpec(float y, float alpha)
        folding it in would make the same build print a different final number
        depending on whether you died in the air. The augment itself still shows
        up, in the chip row below. */
-    snprintf(val[1], sizeof(val[1]), "%.0f%%", UpDamageMul() * WaveDamageMul() * 100.0f);
+    snprintf(val[1], sizeof(val[1]), "%.0f%%", UpDamageMul() * EarnedDamageMul() * 100.0f);
     snprintf(val[2], sizeof(val[2]), "%.0f%%", UpFireMul()       * 100.0f);
     snprintf(val[3], sizeof(val[3]), "%.0f%%", UpRecoilMul()     * 100.0f);
     snprintf(val[4], sizeof(val[4]), "%d",     PlayerMaxHp());
@@ -4914,10 +5695,343 @@ static void DrawGameOver(void)
 /*----------------------------------------------------------------------------*/
 /* Main                                                                       */
 /*----------------------------------------------------------------------------*/
-int main(void)
+/*----------------------------------------------------------------------------*/
+/* Capture mode - DEBUG BUILDS ONLY                                           */
+/*                                                                            */
+/* Compiled only when SHOTCOIL_CAPTURE is defined, which the Debug|x64         */
+/* configuration does and Release does not. The contest is judged on a         */
+/* finished game inside 1.44MB; a hidden developer flag in the submitted       */
+/* binary is weight and surface area that the judge did not ask for, so the    */
+/* shipped exe simply does not have it.                                        */
+/*                                                                            */
+/*   msbuild Project1.sln /p:Configuration=Debug /p:Platform=x64               */
+/*   Project1\\x64\\Debug\\Shotcoil.exe --shot=help --scale=2                     */
+/*                                                                            */
+/* `Shotcoil.exe --shot=SCENE` sets up one screen, simulates a fixed number of */
+/* frames, writes a PNG and exits. It exists because this game cannot be       */
+/* driven from the outside: the cursor is captured in fullscreen, so           */
+/* synthesized clicks and keystrokes go nowhere, and half the UI worth         */
+/* checking - a wave-12 challenge, the upgrade cards, an augment's range ring  */
+/* - is a two-minute run away from the title screen.                           */
+/*                                                                            */
+/* Deliberately inert during a normal launch: one branch in main(), taken only */
+/* when --shot is actually on the command line.                                */
+/*----------------------------------------------------------------------------*/
+
+#ifdef SHOTCOIL_CAPTURE
+
+typedef enum ShotScene {
+    SHOT_OFF, SHOT_TITLE, SHOT_HELP, SHOT_PLAY, SHOT_UPGRADE, SHOT_GAMEOVER
+} ShotScene;
+
+typedef enum ShotQuest { SQ_DEFAULT, SQ_ACTIVE, SQ_FAIL, SQ_DONE } ShotQuest;
+
+typedef struct ShotOpts {
+    ShotScene   scene;
+    const char *out;
+    int         scale;      /* window scale. 1 and 2 land on different rungs of */
+                            /* UISize's 14px grid, which is the single most     */
+                            /* common way a layout in this game breaks          */
+    int         wave;
+    float       at;         /* seconds of simulation before the capture         */
+    unsigned    seed;
+    ShotQuest   quest;
+    int         questKind;  /* QuestKind, or -1 for whatever the roll gives   */
+    int         weapon;     /* -1 = leave whatever the run started with         */
+    bool        fire;       /* hold the trigger - the shot-linked rings, the    */
+                            /* muzzle, the recoil trail all need it             */
+    Vector2     aim;        /* where the reticle sits, in virtual units         */
+    int         aug[UP_COUNT];
+} ShotOpts;
+
+static ShotOpts shot;
+static float    shotT;
+
+/* ASCII handles for the two Korean-named tables. Kept here rather than as a
+   field on WeaponDef/UpgradeDef so those tables stay in their tight column
+   layout. The typedefs underneath are the classic C static assert: a table
+   that grows a row without gaining a key becomes a compile error instead of an
+   off-by-one that silently grants the wrong augment. */
+static const char *const SHOT_WEAPON_KEYS[] = {
+    "pistol", "smg", "sword", "shotgun", "railgun", "grenade", "bazooka",
+    "flamer", "ricochet", "harpoon", "laser"
+};
+static const char *const SHOT_AUG_KEYS[] = {
+    "vitality", "rapid", "caliber", "recoil", "bigshot", "velocity",
+    "asbestos", "deathblast", "lifesteal", "thorns", "greed",
+    "aegis", "pierce", "homing", "scatter", "backblast",
+    "ricochet-aug", "devour", "sniper", "updraft",
+    "execute", "frenzy", "focus", "magnet"
+};
+typedef char shot_weapon_keys_match[
+    (sizeof(SHOT_WEAPON_KEYS) / sizeof(SHOT_WEAPON_KEYS[0]) == WP_COUNT) ? 1 : -1];
+typedef char shot_aug_keys_match[
+    (sizeof(SHOT_AUG_KEYS) / sizeof(SHOT_AUG_KEYS[0]) == UP_COUNT) ? 1 : -1];
+
+static void ShotUsage(void)
 {
+    printf(
+    "SHOTCOIL capture mode\n"
+    "\n"
+    "  Shotcoil.exe --shot=SCENE [options]\n"
+    "\n"
+    "  --shot=SCENE   title | help | play | upgrade | gameover\n"
+    "  --out=FILE     output png, relative to the exe or absolute\n"
+    "                 (default shot-SCENE.png)\n"
+    "  --scale=N      window scale, 1..4    (default 1)\n"
+    "  --wave=N       wave to set up        (default 1)\n"
+    "  --at=SEC       seconds to simulate   (default 1.0)\n"
+    "  --seed=N       rng seed              (default 1)\n"
+    "  --weapon=KEY   see --list\n"
+    "  --aug=K,K,...  grant one stack each; repeat a key to stack it\n"
+    "  --quest=STATE  active | fail | done  (play only)\n"
+    "  --qkind=KIND   airkill | nohit | speedkill | longshot  (pins the roll)\n"
+    "  --fire         hold the trigger down for the whole capture\n"
+    "  --aim=X,Y      reticle position in 1280x720 units (default 640,300)\n"
+    "  --list         print the weapon and augment keys, then exit\n"
+    "\n"
+    "Frames run at a fixed 1/60s, so a given command always renders the same\n"
+    "picture. Vary --scale: font sizes snap to a 14 real-pixel grid, so a line\n"
+    "that fits its panel at one scale can overflow at another.\n");
+}
+
+static void ShotList(void)
+{
+    printf("weapons:\n ");
+    for (int i = 0; i < WP_COUNT; i++) printf(" %s", SHOT_WEAPON_KEYS[i]);
+
+    printf("\n\naugments:\n ");
+    for (int i = 0; i < UP_COUNT; i++)
+    {
+        printf(" %s", SHOT_AUG_KEYS[i]);
+        if (i % 6 == 5 && i != UP_COUNT - 1) printf("\n ");
+    }
+    printf("\n");
+}
+
+/* Matches a --name= prefix and hands back the tail, or NULL. */
+static const char *ShotArg(const char *arg, const char *name)
+{
+    size_t n = strlen(name);
+    if (strncmp(arg, name, n) != 0) return NULL;
+    return arg + n;
+}
+
+static int ShotLookup(const char *const *keys, int count, const char *v, size_t len)
+{
+    for (int i = 0; i < count; i++)
+        if (strlen(keys[i]) == len && strncmp(keys[i], v, len) == 0) return i;
+    return -1;
+}
+
+/* False means the process should stop right here - bad usage, or --list. */
+static bool ShotParse(int argc, char **argv)
+{
+    shot.scene  = SHOT_OFF;
+    shot.scale  = 1;
+    shot.wave   = 1;
+    shot.at     = 1.0f;
+    shot.seed   = 1;
+    shot.quest     = SQ_DEFAULT;
+    shot.questKind = -1;
+    shot.weapon    = -1;
+    shot.aim    = (Vector2){ SCREEN_W / 2.0f, 300.0f };
+
+    for (int i = 1; i < argc; i++)
+    {
+        const char *a = argv[i];
+        const char *v;
+
+        if (strcmp(a, "--fire") == 0) { shot.fire = true; continue; }
+        if (strcmp(a, "--list") == 0) { ShotList();  return false; }
+        if (strcmp(a, "--help") == 0) { ShotUsage(); return false; }
+
+        if ((v = ShotArg(a, "--shot=")) != NULL)
+        {
+            if      (strcmp(v, "title")    == 0) shot.scene = SHOT_TITLE;
+            else if (strcmp(v, "help")     == 0) shot.scene = SHOT_HELP;
+            else if (strcmp(v, "play")     == 0) shot.scene = SHOT_PLAY;
+            else if (strcmp(v, "upgrade")  == 0) shot.scene = SHOT_UPGRADE;
+            else if (strcmp(v, "gameover") == 0) shot.scene = SHOT_GAMEOVER;
+            else { printf("unknown scene: %s\n\n", v); ShotUsage(); return false; }
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--out="))   != NULL) { shot.out   = v;               continue; }
+        if ((v = ShotArg(a, "--scale=")) != NULL) { shot.scale = atoi(v);         continue; }
+        if ((v = ShotArg(a, "--wave="))  != NULL) { shot.wave  = atoi(v);         continue; }
+        if ((v = ShotArg(a, "--at="))    != NULL) { shot.at    = (float)atof(v);  continue; }
+        if ((v = ShotArg(a, "--seed="))  != NULL) { shot.seed  = (unsigned)atoi(v); continue; }
+
+        if ((v = ShotArg(a, "--aim=")) != NULL)
+        {
+            const char *comma = strchr(v, ',');
+            if (comma == NULL) { printf("--aim wants X,Y\n"); return false; }
+            shot.aim = (Vector2){ (float)atof(v), (float)atof(comma + 1) };
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--qkind=")) != NULL)
+        {
+            if      (strcmp(v, "airkill")   == 0) shot.questKind = Q_AIRKILL;
+            else if (strcmp(v, "nohit")     == 0) shot.questKind = Q_NOHIT;
+            else if (strcmp(v, "speedkill") == 0) shot.questKind = Q_SPEEDKILL;
+            else if (strcmp(v, "longshot")  == 0) shot.questKind = Q_LONGSHOT;
+            else { printf("unknown challenge kind: %s\n", v); return false; }
+            if (shot.quest == SQ_DEFAULT) shot.quest = SQ_ACTIVE;
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--quest=")) != NULL)
+        {
+            if      (strcmp(v, "active") == 0) shot.quest = SQ_ACTIVE;
+            else if (strcmp(v, "fail")   == 0) shot.quest = SQ_FAIL;
+            else if (strcmp(v, "done")   == 0) shot.quest = SQ_DONE;
+            else { printf("unknown quest state: %s\n", v); return false; }
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--weapon=")) != NULL)
+        {
+            int w = ShotLookup(SHOT_WEAPON_KEYS, WP_COUNT, v, strlen(v));
+            if (w < 0) { printf("unknown weapon: %s  (try --list)\n", v); return false; }
+            shot.weapon = w;
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--aug=")) != NULL)
+        {
+            while (*v != 0)
+            {
+                const char *comma = strchr(v, ',');
+                size_t      len   = comma ? (size_t)(comma - v) : strlen(v);
+                int         id    = ShotLookup(SHOT_AUG_KEYS, UP_COUNT, v, len);
+
+                if (id < 0)
+                {
+                    printf("unknown augment: %.*s  (try --list)\n", (int)len, v);
+                    return false;
+                }
+                shot.aug[id]++;
+                v = comma ? comma + 1 : v + len;
+            }
+            continue;
+        }
+
+        printf("unknown option: %s\n\n", a);
+        ShotUsage();
+        return false;
+    }
+
+    if (shot.scene == SHOT_OFF) return true;    /* no --shot: just play */
+
+    if (shot.scale < 1) shot.scale = 1;
+    if (shot.scale > 4) shot.scale = 4;
+    if (shot.wave  < 1) shot.wave  = 1;
+    if (shot.at  < 0.0f) shot.at   = 0.0f;
+    return true;
+}
+
+/* Everything that has to happen after the game is initialised but before the
+   first frame. Built out of the same ResetGame / StartWave / RollUpgrades the
+   game itself runs on, so a captured screen is a real one rather than a mock. */
+static void ShotSetup(void)
+{
+    shotOn   = true;
+    shotFire = shot.fire;
+    shotAim  = shot.aim;
+
+    SetRandomSeed(shot.seed);
+    ResetGame();
+
+    for (int i = 0; i < UP_COUNT; i++)
+        for (int k = 0; k < shot.aug[i]; k++) ApplyUpgrade(i);
+
+    if (shot.weapon >= 0) player.weapon = (WeaponType)shot.weapon;
+
+    switch (shot.scene)
+    {
+        case SHOT_TITLE: state = ST_TITLE;    return;
+        case SHOT_HELP:  state = ST_TUTORIAL; return;
+
+        case SHOT_UPGRADE:
+            /* The screen a wave clear leads to, minus the wave. */
+            StartWave(shot.wave);
+            RollUpgrades();
+            pendingPicks = (shot.wave % 5 == 0) ? 2 : 1;
+            upgradeT     = 0.0f;
+            state        = ST_UPGRADE;
+            return;
+
+        case SHOT_GAMEOVER:
+            StartWave(shot.wave);
+            player.alive = false;
+            EndRun();
+            return;
+
+        default:
+            break;
+    }
+
+    StartWave(shot.wave);
+    state = ST_PLAY;
+
+    /* StartWave already rolls a challenge on the waves that carry one; this
+       overrides it so a capture never depends on which wave number you picked. */
+    if (shot.quest != SQ_DEFAULT)
+    {
+        StartQuest(shot.wave);
+
+        /* StartQuest rolls its kind. Re-roll until the requested one comes up
+           rather than reaching into questKind directly - the goal numbers are
+           set inside that switch, and a hand-poked kind would carry the wrong
+           target. Bounded so a future kind that stops being reachable cannot
+           hang the capture. */
+        for (int guard = 0; shot.questKind >= 0 &&
+                            questKind != (QuestKind)shot.questKind &&
+                            guard < 500; guard++)
+            StartQuest(shot.wave);
+
+        if (shot.quest == SQ_FAIL) QuestFail();
+        if (shot.quest == SQ_DONE) QuestSucceed();
+    }
+}
+
+static const char *ShotOutPath(void)
+{
+    if (shot.out != NULL) return shot.out;
+
+    switch (shot.scene)
+    {
+        case SHOT_TITLE:    return "shot-title.png";
+        case SHOT_HELP:     return "shot-help.png";
+        case SHOT_UPGRADE:  return "shot-upgrade.png";
+        case SHOT_GAMEOVER: return "shot-gameover.png";
+        default:            return "shot-play.png";
+    }
+}
+
+#endif  /* SHOTCOIL_CAPTURE */
+
+/*----------------------------------------------------------------------------*/
+
+#ifdef SHOTCOIL_CAPTURE
+int main(int argc, char **argv)
+#else
+int main(void)
+#endif
+{
+#ifdef SHOTCOIL_CAPTURE
+    /* Parsed before anything is created: --list and a bad flag have to be able
+       to answer without opening a window, and --scale decides how big it is. */
+    if (!ShotParse(argc, argv)) return 0;
+
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    InitWindow(SCREEN_W * shot.scale, SCREEN_H * shot.scale, "SHOTCOIL");
+#else
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(SCREEN_W, SCREEN_H, "SHOTCOIL");
+#endif
 
     /* The best-score file is opened by a bare relative name, so it lands in
        whatever the working directory happens to be. Launched from a shortcut or
@@ -4928,9 +6042,27 @@ int main(void)
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);          /* ESC is handled per-screen */
 
-    ToggleBorderlessWindowed();    /* start fullscreen, alt-tab friendly */
-    UpdateViewport();
-    ApplyCursorMode();             /* fullscreen -> lock the pointer in */
+#ifdef SHOTCOIL_CAPTURE
+    /* Capture mode stays windowed at an exact multiple of the virtual
+       resolution - no letterbox bars in the PNG, and viewScale is exactly
+       --scale - and never grabs the pointer, so a failed run cannot leave the
+       cursor trapped. */
+    bool goFullscreen = (shot.scene == SHOT_OFF);
+#else
+    const bool goFullscreen = true;
+#endif
+
+    if (goFullscreen)
+    {
+        ToggleBorderlessWindowed();    /* start fullscreen, alt-tab friendly */
+        UpdateViewport();
+        ApplyCursorMode();             /* fullscreen -> lock the pointer in */
+    }
+    else
+    {
+        fullscreen = false;
+        UpdateViewport();
+    }
 
     LoadUIFonts();
     InitSfx();
@@ -4940,10 +6072,20 @@ int main(void)
     ResetGame();
     state = ST_TITLE;
 
+#ifdef SHOTCOIL_CAPTURE
+    if (shot.scene != SHOT_OFF) ShotSetup();
+#endif
+
     while (!WindowShouldClose())
     {
         float rawDt = GetFrameTime();
         if (rawDt > 1.0f / 30.0f) rawDt = 1.0f / 30.0f;
+
+#ifdef SHOTCOIL_CAPTURE
+        /* A capture must not depend on how fast the machine drew the last
+           frame, or two runs of the same command disagree. */
+        if (shot.scene != SHOT_OFF) rawDt = 1.0f / 60.0f;
+#endif
 
         UpdateViewport();
 
@@ -4966,19 +6108,35 @@ int main(void)
         switch (state)
         {
             case ST_TITLE:
+                if (IsKeyPressed(KEY_T)) { state = ST_TUTORIAL; break; }
+                if ((IsKeyPressed(KEY_ENTER) && !toggledView) ||
+                    IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    /* The first run of the session goes through the help page.
+                       After that it is on T only: a player who just died wants
+                       to be back in the arena, not reading, and a page that
+                       gets dismissed on reflex teaches nobody anything. */
+                    if (!seenTutorial) { seenTutorial = true; state = ST_TUTORIAL; }
+                    else               { ResetGame();         state = ST_PLAY;    }
+                }
+                if (IsKeyPressed(KEY_ESCAPE)) goto quit;
+                break;
+
+            case ST_TUTORIAL:
                 if ((IsKeyPressed(KEY_ENTER) && !toggledView) ||
                     IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
                 {
                     ResetGame();
                     state = ST_PLAY;
                 }
-                if (IsKeyPressed(KEY_ESCAPE)) goto quit;
+                if (IsKeyPressed(KEY_ESCAPE)) state = ST_TITLE;
                 break;
 
             case ST_PLAY:
                 runTime += dt;
                 if (waveBannerT > 0.0f) waveBannerT -= rawDt;
 
+                UpdateQuest(dt);
                 UpdatePlayer(dt);
                 UpdateEnemies(dt);
                 UpdateBullets(dt);
@@ -5022,12 +6180,21 @@ int main(void)
 
             BeginMode2D(ViewCamera(shakeOff));
                 DrawBackground();
-                if (state != ST_TITLE)
+
+                /* The arena exists behind the pause screens but not behind the
+                   two menus - a help page over a live-looking fight is asking
+                   the reader to watch something instead of read. */
+                if (state != ST_TITLE && state != ST_TUTORIAL)
                 {
                     DrawGroundHazard();
                     DrawPickups();
                     for (int i = 0; i < MAX_ENEMIES; i++)
                         if (enemies[i].active) DrawEnemy(&enemies[i]);
+                    /* Under the particles and the shots: these are a reference
+                       grid, not something that should ever sit on top of what
+                       is actually happening. */
+                    DrawAugmentRanges();
+                    DrawLongshotRange();
                     DrawParticles();
                     DrawShocks();
                     DrawBeams();
@@ -5042,8 +6209,9 @@ int main(void)
                 if (flashWhite > 0.0f)
                     DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(RAYWHITE, flashWhite * 0.5f));
 
-                if (state != ST_TITLE) DrawHud();
+                if (state != ST_TITLE && state != ST_TUTORIAL) DrawHud();
                 if (state == ST_TITLE)    DrawTitle();
+                if (state == ST_TUTORIAL) DrawTutorial();
                 if (state == ST_UPGRADE)  DrawUpgradeScreen();
                 if (state == ST_GAMEOVER) DrawGameOver();
                 DrawCrosshair();
@@ -5052,6 +6220,27 @@ int main(void)
         EndScissorMode();
 
         EndDrawing();
+
+#ifdef SHOTCOIL_CAPTURE
+        if (shot.scene != SHOT_OFF)
+        {
+            shotT += rawDt;
+            if (shotT >= shot.at)
+            {
+                /* Not TakeScreenshot: that one glues the working directory onto
+                   whatever it is handed, so an absolute --out came back as
+                   "...\\Project1/C:\\Users\\..." and silently failed to save.
+                   Exporting the frame directly takes the path as given - a bare
+                   name lands next to the exe, a full path lands where it says. */
+                Image frame = LoadImageFromScreen();
+                bool  saved = ExportImage(frame, ShotOutPath());
+                UnloadImage(frame);
+
+                if (!saved) printf("could not write %s\n", ShotOutPath());
+                goto quit;
+            }
+        }
+#endif
     }
 
 quit:

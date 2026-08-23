@@ -296,6 +296,85 @@ fontTools가 필요하다: `pip install fonttools`.
 
 ---
 
+## 10-2. 캡처 모드 (`--shot`) — UI 변경 검증용 · **Debug 빌드 전용**
+
+이 게임은 **바깥에서 자동화할 수 없다.** 전체화면에서 `DisableCursor`로 포인터를
+잡아버려서 SendKeys / mouse_event로 주입한 입력이 창에 도달하지 않는다. 게다가
+확인하고 싶은 화면 대부분(웨이브 12의 도전 HUD, 강화 선택 카드, 증강 범위 링)은
+타이틀에서 2분씩 플레이해야 나온다.
+
+그래서 화면 하나를 세팅하고 → 정해진 시간만큼 시뮬레이션하고 → PNG로 저장하고
+종료하는 모드를 넣어 두었다. 단, **제출용 Release에는 들어가지 않는다.**
+
+### 빌드 분리
+
+캡처 모드 전체가 `#ifdef SHOTCOIL_CAPTURE` 안에 있고, 이 매크로는
+**Debug|x64 구성에서만** 정의된다 (`Project1.vcxproj`의 `PreprocessorDefinitions`).
+심사 기준은 ①완성 ②용량 ③재미뿐이고, 심사자가 요구하지 않은 개발자 플래그가
+제출 바이너리에 남을 이유가 없다. Release에는 `argv` 처리조차 없다
+(`main(void)`로 컴파일된다).
+
+```powershell
+# 캡처용 (도구)
+msbuild Project1\Project1.sln /p:Configuration=Debug /p:Platform=x64
+Project1\x64\Debug\Shotcoil.exe --shot=help --scale=2
+
+# 제출용 (캡처 코드 0바이트)
+msbuild Project1\Project1.sln /p:Configuration=Release /p:Platform=x64
+```
+
+확인법: Release 바이너리를 문자열 검색해서 `--shot=SCENE`이 안 나오면 성공.
+두 구성 모두 `/MT` + `/utf-8` + raylib 정적 링크라 렌더 결과는 동일하다.
+
+### 사용법
+
+```bash
+Shotcoil.exe --shot=SCENE [옵션]      # Debug 빌드
+
+  --shot=SCENE   title | help | play | upgrade | gameover
+  --out=FILE     저장 경로 (상대=exe 옆, 절대경로도 가능)
+  --scale=N      창 배율 1..4           (기본 1)
+  --wave=N       세팅할 웨이브          (기본 1)
+  --at=SEC       캡처 전 시뮬레이션 시간 (기본 1.0)
+  --seed=N       난수 시드              (기본 1)
+  --weapon=KEY   pistol smg sword shotgun railgun grenade bazooka ...
+  --aug=K,K,...  증강 1스택씩 부여 (같은 키를 반복하면 중첩)
+  --quest=STATE  active | fail | done   (play 전용)
+  --qkind=KIND   airkill | nohit | speedkill | longshot  (도전 종류 고정)
+  --fire         캡처 내내 발사 버튼을 누르고 있음
+  --aim=X,Y      조준점 (1280x720 단위, 기본 640,300)
+  --list         무기/증강 키 목록 출력 후 종료
+```
+
+예:
+
+```bash
+Project1\x64\Debug\Shotcoil.exe --shot=upgrade --wave=5   # 보스 클리어 강화 화면
+Shotcoil.exe --shot=play --qkind=longshot                 # 먼 거리 도전 + 범위 원
+Shotcoil.exe --shot=play --quest=fail --at=2.5            # 도전 실패 UI가 사라졌는지
+Shotcoil.exe --shot=play --aug=homing,sniper --fire       # 발사 연동 범위 링
+Shotcoil.exe --shot=help --scale=2                        # 폰트 격자 다른 칸에서 레이아웃
+```
+
+**`--scale`을 반드시 바꿔가며 볼 것.** §10-1대로 폰트 크기가 실제 14픽셀 격자에
+스냅되므로, 배율이 다르면 같은 문장이 가상 단위로 1.5배까지 넓어진다. 한 배율에서
+패널에 들어가던 줄이 다른 배율에서 넘칠 수 있고, 이게 이 UI가 깨지는 가장 흔한 방식이다.
+
+구현 메모:
+- 프레임은 고정 1/60초로 돌린다. 같은 명령은 항상 같은 그림을 낸다.
+- 캡처 모드는 **창 모드 + 커서 자유**다. 레터박스 없는 정확한 `1280*scale x 720*scale`
+  PNG가 나오고, 실패해도 커서가 갇히지 않는다.
+- 조준점도 고정한다(`shotAim`). 실제 마우스를 읽으면 실행할 때마다 그림이 달라진다.
+- 화면 세팅은 게임이 실제로 쓰는 `ResetGame` / `StartWave` / `RollUpgrades`를 그대로
+  호출한다 — 목업이 아니라 진짜 화면이다.
+- Debug 빌드에서도 `--shot` 없이 실행하면 평소처럼 전체화면으로 게임이 시작된다.
+  `shotOn`/`shotFire`가 false로 남고 `UpdateAimCursor`/`UpdatePlayer`의 훅은 통과한다.
+- `SHOT_WEAPON_KEYS` / `SHOT_AUG_KEYS`는 C 정적 어서션(`typedef char x[cond?1:-1]`)으로
+  `WP_COUNT` / `UP_COUNT`와 길이를 검사한다. 표에 항목을 추가하고 키를 안 넣으면
+  **컴파일 에러**가 난다 — 조용히 엉뚱한 증강이 부여되는 대신.
+
+---
+
 ## 11. 다음 액션
 
 **STEP 1 프로토타입 코드부터 시작.**

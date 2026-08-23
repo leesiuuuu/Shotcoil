@@ -121,7 +121,11 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- SHOTCOIL_CAPTURE는 Debug에만 있다. main.c의 캡처 모드(shot 플래그) 전체가
+           이 매크로 안에 들어 있어서, 제출용 Release 실행파일에는 개발자
+           플래그도 argv 처리도 남지 않는다. 화면을 PNG로 뽑으려면
+           Debug|x64로 빌드해서 Project1\x64\Debug\Shotcoil.exe를 쓸 것. -->
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;SHOTCOIL_CAPTURE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>$(RaylibDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- raylib.lib이 /MT로 빌드되어 있어 Debug도 /MT로 맞춘다 -->
