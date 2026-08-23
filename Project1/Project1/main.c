@@ -12,6 +12,7 @@
 #include "raymath.h"
 
 #include <math.h>
+#include <stdio.h>      /* snprintf, for the popup labels */
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,7 +51,6 @@
 
 /*----------------------------------------------------------------------------*/
 /* Tunables - the five (six) numbers that decide whether the game feels good.  */
-/* Editable live from the in-game panel (F1).                                  */
 /*----------------------------------------------------------------------------*/
 typedef struct Tunables {
     float recoilImpulse;    /* how hard one shot throws you            */
@@ -70,22 +70,7 @@ static const Tunables TUNE_DEFAULT = {
     2.0f        /* mouseSens     */
 };
 
-#define PARAM_COUNT 6
-
 static Tunables tune;
-
-typedef struct ParamRow {
-    const char *name;
-    float      *value;
-    float       step;
-    float       min;
-    float       max;
-    int         decimals;
-} ParamRow;
-
-static ParamRow params[PARAM_COUNT];
-static int  paramSel     = 0;
-static bool panelVisible = false;
 
 /*----------------------------------------------------------------------------*/
 /* Weapons                                                                    */
@@ -301,6 +286,11 @@ typedef struct Bullet {
     bool    slash;
     bool    active;
     Color   color;
+    /* Where this shot left the muzzle, for SNIPER's distance falloff. Appended
+       rather than slotted in beside `pos` so the positional initialisers that
+       build enemy fire keep working untouched - they simply leave it zeroed,
+       and BulletDamage never reads it for a bullet that is not the player's. */
+    Vector2 origin;
 } Bullet;
 
 typedef struct Enemy {
@@ -369,12 +359,18 @@ typedef struct Beam {
 } Beam;
 
 typedef struct Popup {
-    Vector2     pos;
-    float       life;
-    int         value;
-    const char *label;      /* when set, shown instead of the number */
-    Color       color;
-    bool        active;
+    Vector2 pos;
+    float   life;
+    int     value;
+    /* Owned, not borrowed. This used to be a `const char *`, which is a trap
+       for the one caller that formats its text: raylib's TextFormat hands back
+       a slot from a ring of four static buffers, and the HUD alone burns that
+       many every frame - so a popup that lives 0.8s was pointing at whatever
+       had been formatted since. Copying costs 32 bytes a popup and cannot
+       dangle. Empty means "show the number instead". */
+    char    label[28];
+    Color   color;
+    bool    active;
 } Popup;
 
 /*----------------------------------------------------------------------------*/
@@ -680,8 +676,18 @@ typedef enum UpgradeId {
     UP_ASBESTOS, UP_DEATHBLAST, UP_LIFESTEAL, UP_THORNS, UP_GREED,
     /* The ones below change what a shot DOES rather than how big its number
        is. They are what a build ends up being remembered for. */
-    UP_AEGIS, UP_PIERCE, UP_HOMING, UP_SCATTER, UP_BACKBLAST, UP_COUNT
+    UP_AEGIS, UP_PIERCE, UP_HOMING, UP_SCATTER, UP_BACKBLAST,
+    /* ONE-TIME AUGMENTS. Everything above is a stat you can keep buying; these
+       four are taken once and then gone from the pool. They do not scale a
+       number, they attach a RULE to the bullet - which is why each one is
+       worth a card slot even at wave 2, and why none of them is ever the
+       obvious pick. Kept contiguous at the end of the enum on purpose: that is
+       what lets the roll and the card art recognise them without a per-entry
+       flag that could drift out of sync with the table. */
+    UP_RICOCHET, UP_DEVOUR, UP_SNIPER, UP_UPDRAFT, UP_COUNT
 } UpgradeId;
+
+#define UP_SPECIAL_FIRST  UP_RICOCHET
 
 /* Two knobs decide how an upgrade feels over a long run:
  *
@@ -728,10 +734,42 @@ static const UpgradeDef UPGRADES[UP_COUNT] = {
     /* The strongest thing in the game: one stack multiplies the output of
        every weapon at once, and four is already a wall of shot. */
     { "산탄화",    "탄 1발 추가 발사",                    4,  18, { 255, 190, 130, 255 } },
-    { "반동 폭풍", "발사 시 뒤로 충격파",                 5,  26, { 180, 160, 255, 255 } }
+    { "반동 폭풍", "발사 시 뒤로 충격파",                 5,  26, { 180, 160, 255, 255 } },
+
+    /* The one-time augments. Rare (16 against a pool that sums past 900, so
+       roughly one upgrade screen in six shows one) and capped at a single
+       stack, because a second copy of a rule is not a rule any more.
+     *
+     * Each one GRANTS the mechanic it feeds on - RICOCHET hands out bounces,
+       DEVOUR hands out a pierce - so it is never a dead card in the hands of a
+       gun that happened to lack it. That is the whole reason they can afford to
+       be this rare: a rare card that might do nothing is just a wasted pick. */
+    { "난반사",    "튕길수록 데미지 증가",                1,  16, { 130, 235, 255, 255 } },
+    { "포식",      "관통할수록 크고 강해짐",              1,  16, { 255, 150, 210, 255 } },
+    { "저격",      "멀리 날아갈수록 강해짐",              1,  16, { 200, 255, 160, 255 } },
+    { "체공",      "오래 떠 있을수록 강해짐",             1,  16, { 255, 210, 140, 255 } }
 };
 
+/* ---- one-time augment tuning ---- */
+/* Compounding per event, so the ceiling is set by how many events a shot can
+   survive rather than by a cap: three bounces is 2.5x, four pierces is 2.9x. */
+#define RICOCHET_GAIN    0.35f   /* damage gained per wall bounce             */
+#define RICOCHET_BOUNCE  2       /* granted, so it works on guns with none    */
+#define DEVOUR_DMG       0.30f   /* damage gained per enemy pierced           */
+#define DEVOUR_SIZE      0.22f   /* and the shot visibly grows with it        */
+#define DEVOUR_PIERCE    1
+/* These two are capped instead: both feed off a quantity the player controls
+   directly, and uncapped they would just be "stand still and win". */
+#define SNIPER_PER_PX    0.0013f /* +13% per 100px of travel                  */
+#define SNIPER_MAX       1.10f   /* caps around 850px - two thirds of the arena */
+#define UPDRAFT_PER_SEC  0.14f
+#define UPDRAFT_MAX      0.70f
+
 static int upStacks[UP_COUNT];
+
+/* Waves survived this run. Unlike upStacks this is not a choice - it is the
+   floor under every build, handed out for clearing rather than for picking. */
+static int waveClears;
 static int upChoices[3];
 static int   pendingPicks;      /* boss clears grant two picks instead of one */
 static float upgradeT;          /* seconds since the choice screen appeared */
@@ -770,6 +808,55 @@ static float UpSizeMul(void)    { return SizeMulAt(upStacks[UP_BIGSHOT]); }
 static float UpSpeedMul(void)   { return SpeedMulAt(upStacks[UP_VELOCITY]); }
 static float UpScoreMul(void)   { return ScoreMulAt(upStacks[UP_GREED]); }
 static float UpGroundTime(void) { return GroundTimeAt(upStacks[UP_ASBESTOS]); }
+
+/* Attack power earned by clearing waves, on top of whatever the build bought.
+ *
+ * 3% a wave, flat, is deliberately just under the rank-and-file health ramp
+ * (7% a wave from 12, see SpawnEnemy). Through the teens the two nearly cancel:
+ * enemies get tougher, you get stronger, and what actually grows is how many of
+ * them there are - which is the pressure a new player can read. From wave 20 the
+ * enemy side picks up a compounding term and this one does not, so the run
+ * starts falling behind again on purpose. It is a floor, not a substitute for
+ * the upgrade cards: by wave 30 it is worth 1.9x, while a single CALIBER stack
+ * is 1.25x and they multiply. */
+#define WAVE_DAMAGE_PER  0.03f
+static float WaveDamageMul(void) { return 1.0f + WAVE_DAMAGE_PER * waveClears; }
+
+static bool HasAug(int id) { return upStacks[id] > 0; }
+
+/* True for the one-time augments, which the enum keeps contiguous at the end
+   so this stays a comparison rather than a table lookup. */
+static bool UpgradeIsSpecial(int id) { return id >= UP_SPECIAL_FIRST; }
+
+/* UPDRAFT: the longer since you last touched the floor, the harder you hit.
+   Deliberately reads player.airTime - the same gauge the no-touch combo runs
+   on - so the augment rewards exactly what the game was already asking for and
+   the player has one rule to learn instead of two. */
+static float UpdraftMul(void)
+{
+    if (!HasAug(UP_UPDRAFT)) return 1.0f;
+    float g = UPDRAFT_PER_SEC * player.airTime;
+    return 1.0f + ((g > UPDRAFT_MAX) ? UPDRAFT_MAX : g);
+}
+
+/* Every shot the player fires goes through this - the build, the clears and
+   the airborne bonus multiply rather than any of them replacing another. */
+static float PlayerDamageMul(void)
+{
+    return UpDamageMul() * WaveDamageMul() * UpdraftMul();
+}
+
+/* SNIPER: scales with how far THIS shot has actually flown. Resolved where the
+   damage is spent rather than baked in at spawn, so one bullet is weak at the
+   muzzle and lethal across the arena - which is the entire point of it. Every
+   place that spends a player bullet's damage must go through here. */
+static float BulletDamage(const Bullet *b)
+{
+    if (!b->fromPlayer || !HasAug(UP_SNIPER)) return b->damage;
+
+    float g = Vector2Distance(b->origin, b->pos) * SNIPER_PER_PX;
+    return b->damage * (1.0f + ((g > SNIPER_MAX) ? SNIPER_MAX : g));
+}
 
 /* Single source of truth: the ring drawn on screen and the circle the damage
    loop tests against must never be allowed to disagree. */
@@ -840,9 +927,14 @@ static const char *UpgradeValue(int id)
             return TextFormat("연사 간격 %.0f%% → %.0f%%",
                               FireMulAt(n) * 100.0f, FireMulAt(n + 1) * 100.0f);
 
+        /* Shows the damage you will actually deal, clears folded in - a card
+           promising "100% -> 125%" while the HUD reads 157% would look like two
+           different stats. The step between the two numbers is still exactly
+           what this pick is worth. */
         case UP_CALIBER:
             return TextFormat("공격력 %.0f%% → %.0f%%",
-                              DamageMulAt(n) * 100.0f, DamageMulAt(n + 1) * 100.0f);
+                              DamageMulAt(n)     * WaveDamageMul() * 100.0f,
+                              DamageMulAt(n + 1) * WaveDamageMul() * 100.0f);
         case UP_RECOIL:
             return TextFormat("반동 %.0f%% → %.0f%%",
                               RecoilMulAt(n) * 100.0f, RecoilMulAt(n + 1) * 100.0f);
@@ -906,6 +998,21 @@ static const char *UpgradeValue(int id)
             return (n <= 0) ? TextFormat("반경 %.0f", next)
                             : TextFormat("반경 %.0f → %.0f", now, next);
         }
+
+        /* One-time augments have no "now -> next": they are off or they are on.
+           So the line states the rule's rate instead, which is the number the
+           player actually has to weigh against a stack they could take again. */
+        case UP_RICOCHET:
+            return TextFormat("튕길 때마다 +%.0f%%   (튕김 +%d)",
+                              RICOCHET_GAIN * 100.0f, RICOCHET_BOUNCE);
+        case UP_DEVOUR:
+            return TextFormat("관통마다 +%.0f%% / 크기 +%.0f%%",
+                              DEVOUR_DMG * 100.0f, DEVOUR_SIZE * 100.0f);
+        case UP_SNIPER:
+            return TextFormat("거리에 비례   (최대 +%.0f%%)", SNIPER_MAX * 100.0f);
+        case UP_UPDRAFT:
+            return TextFormat("1초당 +%.0f%%   (최대 +%.0f%%)",
+                              UPDRAFT_PER_SEC * 100.0f, UPDRAFT_MAX * 100.0f);
     }
     return NULL;
 }
@@ -1140,8 +1247,13 @@ static void AddPopupEx(Vector2 pos, int value, const char *label, Color color)
         popups[i].pos    = pos;
         popups[i].life   = 0.8f;
         popups[i].value  = value;
-        popups[i].label  = label;
         popups[i].color  = color;
+        /* snprintf, not raylib's TextCopy - that one is an unbounded strcpy.
+           28 bytes is roughly double the longest label in the game (the weapon
+           names, at 15 bytes of UTF-8), so the bound is a guard that should
+           never actually fire rather than a truncation anyone will see. */
+        if (label) snprintf(popups[i].label, sizeof(popups[i].label), "%s", label);
+        else       popups[i].label[0] = 0;
         return;
     }
 }
@@ -1223,9 +1335,12 @@ static void SpawnPlayerShot(Vector2 pos, Vector2 vel, const WeaponDef *w)
     {
         if (bullets[i].active) continue;
         bullets[i] = (Bullet){ pos, vel, w->bulletRadius * UpSizeMul(), w->life, w->life,
-                               w->damage * UpDamageMul(), w->bulletGravity, w->bounces,
-                               w->pierce + upStacks[UP_PIERCE], -1,
+                               w->damage * PlayerDamageMul(), w->bulletGravity,
+                               w->bounces + (HasAug(UP_RICOCHET) ? RICOCHET_BOUNCE : 0),
+                               w->pierce + upStacks[UP_PIERCE]
+                                         + (HasAug(UP_DEVOUR) ? DEVOUR_PIERCE : 0), -1,
                                true, w->explosive, w->slash, true, w->color };
+        bullets[i].origin = pos;
         return;
     }
 }
@@ -1805,11 +1920,11 @@ static void FireBeam(Vector2 from, Vector2 dir, const WeaponDef *w)
            cover for the whole room. */
         if (ShieldBlocks(e, from))
         {
-            ShieldHit(e, w->damage * UpDamageMul(), from, w->color);
+            ShieldHit(e, w->damage * PlayerDamageMul(), from, w->color);
             continue;
         }
 
-        DamageEnemy(e, w->damage * UpDamageMul(), from);
+        DamageEnemy(e, w->damage * PlayerDamageMul(), from);
     }
 
     for (int i = 0; i < MAX_BEAMS; i++)
@@ -2136,6 +2251,15 @@ static void UpdateSpawning(float dt)
         if (!waveCleared)
         {
             waveCleared = true;
+
+            /* Every wave pays out, boss or not. The cards are a choice you can
+               get wrong; this is the one reward that just accrues, so a run
+               that keeps drawing upgrades it cannot use still gets stronger. */
+            waveClears++;
+            AddPopupEx((Vector2){ player.pos.x, player.pos.y - 30.0f }, 0,
+                       TextFormat("공격력 +%.0f%%", WAVE_DAMAGE_PER * 100.0f),
+                       (Color){ 255, 170, 120, 255 });
+
             if (bossWave)
             {
                 int before = player.hp;
@@ -3310,7 +3434,7 @@ static void UpdateBullets(float dt)
                damaging its own side and healing nobody. */
             if (b->explosive)
             {
-                if (b->fromPlayer) Explode(b->pos, b->damage, b->color);
+                if (b->fromPlayer) Explode(b->pos, BulletDamage(b), b->color);
                 else               BomberBlast(b->pos, BOMB_RADIUS);
             }
             continue;
@@ -3364,11 +3488,21 @@ static void UpdateBullets(float dt)
                 if (b->bounces-- <= 0)
                 {
                     b->active = false;
-                    if (b->explosive) Explode(b->pos, b->damage, b->color);
+                    if (b->explosive) Explode(b->pos, BulletDamage(b), b->color);
                     continue;
                 }
                 if (b->grav > 0.0f) b->vel = Vector2Scale(b->vel, 0.62f);
                 EmitBurst(b->pos, 0.0f, PI, 4, 40.0f, 150.0f, 0.2f, 2.5f, b->color, 100.0f);
+
+                /* RICOCHET: every wall the shot survives makes it hit harder.
+                   The ring is not decoration - a bullet that got stronger has
+                   to LOOK different off the wall, or the player has no way to
+                   tell a live trick shot from a stray one. */
+                if (HasAug(UP_RICOCHET))
+                {
+                    b->damage *= 1.0f + RICOCHET_GAIN;
+                    AddShock(b->pos, 26.0f, b->color);
+                }
 
                 /* The path bent this frame, so the straight segment no longer
                    describes where the shot went. Collapse the sweep to a point
@@ -3389,7 +3523,7 @@ static void UpdateBullets(float dt)
                 if (b->explosive)
                 {
                     b->active = false;
-                    Explode(b->pos, b->damage, b->color);
+                    Explode(b->pos, BulletDamage(b), b->color);
                     break;
                 }
 
@@ -3398,17 +3532,33 @@ static void UpdateBullets(float dt)
                    or the enemy would be a speed bump for half the guns. */
                 if (ShieldBlocks(e, b->pos))
                 {
-                    ShieldHit(e, b->damage, b->pos, b->color);
+                    ShieldHit(e, BulletDamage(b), b->pos, b->color);
                     b->active = false;
                     break;
                 }
 
-                DamageEnemy(e, b->damage, b->pos);
+                DamageEnemy(e, BulletDamage(b), b->pos);
 
                 /* A piercing shot carries on, but remembers who it just went
                    through so one pass can never land as two hits. */
-                if (b->pierce > 0) { b->pierce--; b->lastHit = j; }
-                else                 b->active = false;
+                if (b->pierce > 0)
+                {
+                    b->pierce--;
+                    b->lastHit = j;
+
+                    /* DEVOUR: the shot eats what it passes through. Growing the
+                       radius as well as the number matters twice over - it is
+                       the only readout the player gets mid-flight, and a wider
+                       shot genuinely catches more, so the augment compounds
+                       into itself instead of just printing bigger figures. */
+                    if (HasAug(UP_DEVOUR))
+                    {
+                        b->damage *= 1.0f + DEVOUR_DMG;
+                        b->radius *= 1.0f + DEVOUR_SIZE;
+                        AddShock(b->pos, b->radius * 2.4f, b->color);
+                    }
+                }
+                else b->active = false;
                 break;
             }
         }
@@ -3477,6 +3627,7 @@ static void ResetGame(void)
 
     /* upgrades are run-scoped: dying wipes the build, same as the weapon */
     memset(upStacks, 0, sizeof(upStacks));
+    waveClears   = 0;
     blastDepth   = 0;
     pendingPicks = 0;
     healSpawnT     = 0.0f;
@@ -3518,40 +3669,6 @@ static void EndRun(void)
         newRecord = true;
         SaveBest(bestScore);
     }
-}
-
-/*----------------------------------------------------------------------------*/
-/* Tuning panel                                                               */
-/*----------------------------------------------------------------------------*/
-static void InitParams(void)
-{
-    params[0] = (ParamRow){ "반동 세기",   &tune.recoilImpulse, 20.0f,  50.0f, 1500.0f, 0 };
-    params[1] = (ParamRow){ "중력",       &tune.gravity,       25.0f, 100.0f, 3000.0f, 0 };
-    params[2] = (ParamRow){ "공기저항",    &tune.airDrag,        0.002f, 0.90f,   1.0f, 3 };
-    params[3] = (ParamRow){ "연사 간격",   &tune.fireCooldown,   0.01f,  0.03f,  1.5f, 3 };
-    params[4] = (ParamRow){ "지면 허용",   &tune.groundTime,     0.10f,  0.40f,  8.0f, 2 };
-    params[5] = (ParamRow){ "마우스 감도", &tune.mouseSens,      0.10f,  0.20f,  8.0f, 2 };
-}
-
-static void UpdatePanel(void)
-{
-    if (IsKeyPressed(KEY_F1)) panelVisible = !panelVisible;
-    if (!panelVisible) return;
-
-    int count = PARAM_COUNT;
-    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) paramSel = (paramSel + 1) % count;
-    if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP))   paramSel = (paramSel + count - 1) % count;
-
-    float mul = IsKeyDown(KEY_LEFT_SHIFT) ? 0.2f : 1.0f;
-    ParamRow *p = &params[paramSel];
-
-    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) *p->value += p->step * mul;
-    if (IsKeyPressed(KEY_LEFT)  || IsKeyPressedRepeat(KEY_LEFT))  *p->value -= p->step * mul;
-
-    if (*p->value < p->min) *p->value = p->min;
-    if (*p->value > p->max) *p->value = p->max;
-
-    if (IsKeyPressed(KEY_HOME)) tune = TUNE_DEFAULT;
 }
 
 /*----------------------------------------------------------------------------*/
@@ -4364,8 +4481,8 @@ static void DrawPopups(void)
     {
         if (!popups[i].active) continue;
         float a = popups[i].life / 0.8f;
-        const char *t = popups[i].label ? popups[i].label
-                                        : TextFormat("%d", popups[i].value);
+        const char *t = popups[i].label[0] ? popups[i].label
+                                           : TextFormat("%d", popups[i].value);
         UIDrawC(FW_BOLD, t, popups[i].pos.x, popups[i].pos.y, 20.0f,
                 Fade(popups[i].color, a));
     }
@@ -4398,9 +4515,17 @@ static void DrawHud(void)
     /* current weapon - permanent, so it is simply stated rather than timed */
     {
         const WeaponDef *w = &WEAPONS[player.weapon];
-        UIDraw(FW_REG, "무기", 24.0f, SCREEN_H - 98.0f, 20.0f,
+        UIDraw(FW_REG, "무기", 24.0f, SCREEN_H - 126.0f, 20.0f,
                (Color){ 160, 170, 200, 200 });
-        UIDraw(FW_BOLD, w->name, 24.0f, SCREEN_H - 74.0f, 28.0f, w->color);
+        UIDraw(FW_BOLD, w->name, 24.0f, SCREEN_H - 102.0f, 28.0f, w->color);
+
+        /* Under the weapon because it multiplies whatever is above it. Stated
+           as one total: the player has no way to act on the split between what
+           the clears gave and what the cards did. */
+        UIDraw(FW_REG, "공격력", 24.0f, SCREEN_H - 62.0f, 20.0f,
+               (Color){ 160, 170, 200, 200 });
+        UIDraw(FW_BOLD, TextFormat("%.0f%%", PlayerDamageMul() * 100.0f),
+               24.0f, SCREEN_H - 38.0f, 28.0f, (Color){ 255, 190, 130, 255 });
     }
 
     if (player.combo > 0)
@@ -4428,42 +4553,6 @@ static void DrawHud(void)
         UIDrawC(FW_BOLD, t, SCREEN_W / 2.0f, SCREEN_H / 2.0f - 120.0f, 70.0f,
                 Fade(RAYWHITE, a * 0.9f));
     }
-
-    if (!panelVisible)
-        UIDraw(FW_REG, "F1  튜닝", SCREEN_W - 116.0f, SCREEN_H - 30.0f, 18.0f,
-               (Color){ 120, 130, 160, 180 });
-}
-
-static void DrawPanel(void)
-{
-    if (!panelVisible) return;
-
-    int w = 376, h = PARAM_COUNT * 32 + 116;
-    int x = SCREEN_W - w - 20, y = 90;
-
-    DrawRectangle(x, y, w, h, (Color){ 8, 10, 22, 225 });
-    DrawRectangleLines(x, y, w, h, (Color){ 90, 200, 255, 160 });
-    UIDraw(FW_BOLD, "손맛 튜닝", x + 16.0f, y + 12.0f, 24.0f, (Color){ 120, 230, 255, 255 });
-
-    for (int i = 0; i < PARAM_COUNT; i++)
-    {
-        int ry = y + 52 + i * 32;
-        bool sel = (i == paramSel);
-        if (sel) DrawRectangle(x + 6, ry - 5, w - 12, 30, (Color){ 90, 200, 255, 40 });
-
-        Color nameCol = sel ? RAYWHITE : (Color){ 165, 175, 200, 255 };
-        UIDraw(sel ? FW_BOLD : FW_REG, params[i].name, x + 16.0f, (float)ry, 20.0f, nameCol);
-
-        const char *v = TextFormat("%.*f", params[i].decimals, *params[i].value);
-        UIDraw(sel ? FW_BOLD : FW_REG, v,
-               x + w - 16.0f - UIWidth(sel ? FW_BOLD : FW_REG, v, 20.0f), (float)ry, 20.0f,
-               sel ? (Color){ 255, 225, 120, 255 } : (Color){ 200, 210, 230, 255 });
-    }
-
-    UIDraw(FW_REG, "위아래 선택    좌우 조절", x + 16.0f, y + h - 50.0f, 18.0f,
-           (Color){ 130, 145, 175, 255 });
-    UIDraw(FW_REG, "SHIFT 미세    HOME 초기화", x + 16.0f, y + h - 28.0f, 18.0f,
-           (Color){ 130, 145, 175, 255 });
 }
 
 /*----------------------------------------------------------------------------*/
@@ -4499,7 +4588,7 @@ static void DrawTitle(void)
         UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 580.0f,
                 24.0f, (Color){ 255, 225, 120, 255 });
 
-    UIDrawC(FW_REG, "F1  튜닝      F11  창 모드      ESC  종료", SCREEN_W / 2.0f,
+    UIDrawC(FW_REG, "F11  창 모드      ESC  종료", SCREEN_W / 2.0f,
             SCREEN_H - 52.0f, 20.0f, (Color){ 120, 132, 160, 255 });
 }
 
@@ -4594,6 +4683,25 @@ static void DrawUpgradeScreen(void)
                              Fade(hot ? WHITE : u->color, (hot ? 1.0f : 0.75f) * a));
         DrawRectangle((int)r.x, (int)r.y, (int)r.width, 6, Fade(u->color, a));
 
+        /* A one-time augment is a different KIND of decision from a stat stack,
+           so it gets flagged above the card rather than dressed up inside it -
+           the player has to be able to spot it before reading three cards. The
+           tag sits in the gap under the header, which is empty by construction. */
+        if (UpgradeIsSpecial(id))
+        {
+            Rectangle tag = { r.x, r.y - 36.0f, r.width, 28.0f };
+            DrawRectangleRec(tag, Fade(u->color, 0.16f * a));
+            DrawRectangleLinesEx(tag, 1.0f, Fade(u->color, 0.5f * a));
+            UIDrawC(FW_BOLD, "특수 증강  -  1회 한정", r.x + r.width / 2.0f,
+                    r.y - 32.0f, 20.0f, Fade(u->color, a));
+
+            /* Inset frame: the tag names it, this makes the whole card read as
+               different out of the corner of the eye. */
+            DrawRectangleLinesEx((Rectangle){ r.x + 6.0f, r.y + 12.0f,
+                                              r.width - 12.0f, r.height - 18.0f },
+                                 1.0f, Fade(u->color, 0.32f * a));
+        }
+
         UIDraw(FW_BOLD, TextFormat("%d", i + 1), r.x + 16.0f, r.y + 20.0f, 24.0f,
                Fade(WHITE, 0.5f * a));
         UIDrawC(FW_BOLD, u->name, r.x + r.width / 2.0f, r.y + 62.0f, 36.0f,
@@ -4646,33 +4754,160 @@ static void DrawUpgradeScreen(void)
     }
 }
 
+/* The build the run died with. Everything here is formatted into local buffers
+   rather than held as TextFormat pointers: that helper hands back slots from a
+   ring of four, and this needs a dozen strings alive at once to measure them
+   before it can centre anything (AddPopupEx documents the same trap).
+
+   Returns the y it finished at, so the caller can put the prompt under it. */
+static float DrawFinalSpec(float y, float alpha)
+{
+    const WeaponDef *w = &WEAPONS[player.weapon];
+
+    /* ---- headline numbers ---- */
+    /* The five the player was actually feeling by the end. Fire rate keeps the
+       card's "간격" framing on purpose - lower is better, and a number that
+       shrank under a label saying 속도 would read as a bug. */
+    enum { CORE = 5 };
+    const char *lab[CORE] = { "무기", "공격력", "연사 간격", "반동", "최대 체력" };
+    char        val[CORE][32];
+    Color       col[CORE] = { w->color,
+                              { 255, 190, 130, 255 },
+                              { 255, 225, 120, 255 },
+                              { 150, 200, 255, 255 },
+                              { 120, 255, 170, 255 } };
+
+    snprintf(val[0], sizeof(val[0]), "%s",     w->name);
+    /* Build only - UpdraftMul is deliberately left out. It reads player.airTime,
+       which is frozen at whatever it happened to be when the run ended, so
+       folding it in would make the same build print a different final number
+       depending on whether you died in the air. The augment itself still shows
+       up, in the chip row below. */
+    snprintf(val[1], sizeof(val[1]), "%.0f%%", UpDamageMul() * WaveDamageMul() * 100.0f);
+    snprintf(val[2], sizeof(val[2]), "%.0f%%", UpFireMul()       * 100.0f);
+    snprintf(val[3], sizeof(val[3]), "%.0f%%", UpRecoilMul()     * 100.0f);
+    snprintf(val[4], sizeof(val[4]), "%d",     PlayerMaxHp());
+
+    const float GAP = 54.0f;
+    float colW[CORE], total = 0.0f;
+    for (int i = 0; i < CORE; i++)
+    {
+        float a = UIWidth(FW_REG,  lab[i], 20.0f);
+        float b = UIWidth(FW_BOLD, val[i], 30.0f);
+        colW[i] = (a > b) ? a : b;
+        total  += colW[i] + (i ? GAP : 0.0f);
+    }
+
+    float x = SCREEN_W / 2.0f - total / 2.0f;
+    for (int i = 0; i < CORE; i++)
+    {
+        float cx = x + colW[i] / 2.0f;
+        UIDrawC(FW_REG,  lab[i], cx, y,          20.0f,
+                Fade((Color){ 150, 162, 190, 255 }, alpha));
+        UIDrawC(FW_BOLD, val[i], cx, y + 26.0f,  30.0f, Fade(col[i], alpha));
+        x += colW[i] + GAP;
+    }
+    y += 84.0f;
+
+    /* ---- the cards that were picked ---- */
+    char  chip[UP_COUNT][40];
+    float chipW[UP_COUNT];
+    int   idx[UP_COUNT];
+    int   count = 0;
+
+    for (int i = 0; i < UP_COUNT; i++)
+    {
+        if (upStacks[i] <= 0) continue;
+        idx[count] = i;
+        snprintf(chip[count], sizeof(chip[count]), "%s x%d", UPGRADES[i].name, upStacks[i]);
+        chipW[count] = UIWidth(FW_BOLD, chip[count], 22.0f);
+        count++;
+    }
+
+    if (count == 0)
+    {
+        UIDrawC(FW_REG, "획득한 강화 없음", SCREEN_W / 2.0f, y, 22.0f,
+                Fade((Color){ 130, 140, 165, 255 }, alpha));
+        return y + 34.0f;
+    }
+
+    /* Greedy wrap. Rows are centred one at a time, so a trailing short row sits
+       under the middle of the block rather than hanging off the left. */
+    const float CGAP = 26.0f, MAXW = 1000.0f;
+    int row = 0;
+    while (row < count)
+    {
+        int   end = row;
+        float rw  = 0.0f;
+        while (end < count)
+        {
+            float next = rw + chipW[end] + (end > row ? CGAP : 0.0f);
+            if (end > row && next > MAXW) break;
+            rw = next;
+            end++;
+        }
+
+        float cx = SCREEN_W / 2.0f - rw / 2.0f;
+        for (int i = row; i < end; i++)
+        {
+            UIDraw(FW_BOLD, chip[i], cx, y, 22.0f, Fade(UPGRADES[idx[i]].color, alpha));
+            cx += chipW[i] + CGAP;
+        }
+        y   += 32.0f;
+        row  = end;
+    }
+    return y + 2.0f;
+}
+
 static void DrawGameOver(void)
 {
     DrawRectangle(0, 0, SCREEN_W, SCREEN_H, (Color){ 0, 0, 0, 150 });
 
-    UIDrawC(FW_BOLD, "패배", SCREEN_W / 2.0f, 170.0f, 84.0f,
+    UIDrawC(FW_BOLD, "패배", SCREEN_W / 2.0f, 92.0f, 84.0f,
             (Color){ 255, 90, 110, 255 });
 
-    UIDrawC(FW_BOLD, TextFormat("점수  %ld", score), SCREEN_W / 2.0f, 300.0f, 42.0f,
+    UIDrawC(FW_BOLD, TextFormat("점수  %ld", score), SCREEN_W / 2.0f, 208.0f, 42.0f,
             RAYWHITE);
 
     UIDrawC(FW_REG, TextFormat("웨이브 %d 도달   -   %.0f초", wave, runTime),
-            SCREEN_W / 2.0f, 356.0f, 24.0f, (Color){ 170, 185, 215, 255 });
+            SCREEN_W / 2.0f, 264.0f, 24.0f, (Color){ 170, 185, 215, 255 });
 
     if (newRecord)
     {
         float pulse = 0.6f + 0.4f * sinf((float)GetTime() * 6.0f);
-        UIDrawC(FW_BOLD, "신기록!", SCREEN_W / 2.0f, 398.0f, 36.0f,
+        UIDrawC(FW_BOLD, "신기록!", SCREEN_W / 2.0f, 302.0f, 36.0f,
                 Fade((Color){ 255, 225, 120, 255 }, pulse));
     }
     else
     {
-        UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 400.0f,
+        UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 304.0f,
                 28.0f, (Color){ 255, 225, 120, 255 });
     }
 
+    /* The spec sheet fades in a beat after the score so the eye reads the run's
+       result first and its build second, rather than meeting a wall of numbers
+       at the same instant the player died. */
+    float promptY = 622.0f;
+    float specA   = (gameOverT - 0.35f) / 0.4f;
+    if (specA > 0.0f)
+    {
+        if (specA > 1.0f) specA = 1.0f;
+
+        DrawRectangle(SCREEN_W / 2 - 470, 366, 940, 1,
+                      Fade((Color){ 110, 125, 160, 255 }, 0.5f * specA));
+        UIDrawC(FW_REG, "최종 스펙", SCREEN_W / 2.0f, 382.0f, 20.0f,
+                Fade((Color){ 130, 142, 172, 255 }, specA));
+
+        /* The chip rows wrap, so the block's height depends on how many cards
+           the run picked. Let the prompt follow it rather than sitting at a
+           fixed y a tall build would collide with - floored so a short build
+           does not leave it stranded halfway up the screen. */
+        promptY = DrawFinalSpec(420.0f, specA) + 46.0f;
+        if (promptY < 622.0f) promptY = 622.0f;
+    }
+
     if (gameOverT > 0.5f)
-        UIDrawC(FW_BOLD, "R  다시 시작        ESC  종료", SCREEN_W / 2.0f, 488.0f, 28.0f,
+        UIDrawC(FW_BOLD, "R  다시 시작        ESC  종료", SCREEN_W / 2.0f, promptY, 28.0f,
                 Fade(RAYWHITE, 0.6f + 0.4f * sinf((float)GetTime() * 4.0f)));
 }
 
@@ -4683,6 +4918,13 @@ int main(void)
 {
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(SCREEN_W, SCREEN_H, "SHOTCOIL");
+
+    /* The best-score file is opened by a bare relative name, so it lands in
+       whatever the working directory happens to be. Launched from a shortcut or
+       from Explorer's search that is not the folder the exe sits in - the record
+       would be written somewhere else, or nowhere if the spot is read-only.
+       Pinning the working directory to the executable keeps the save beside it. */
+    ChangeDirectory(GetApplicationDirectory());
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);          /* ESC is handled per-screen */
 
@@ -4694,7 +4936,6 @@ int main(void)
     InitSfx();
 
     tune = TUNE_DEFAULT;
-    InitParams();
     bestScore = LoadBest();
     ResetGame();
     state = ST_TITLE;
@@ -4717,8 +4958,6 @@ int main(void)
         }
 
         UpdateAimCursor();
-
-        UpdatePanel();
 
         float dt = rawDt;
         if (hitstop > 0.0f) { hitstop -= rawDt; dt = 0.0f; }
@@ -4807,7 +5046,6 @@ int main(void)
                 if (state == ST_TITLE)    DrawTitle();
                 if (state == ST_UPGRADE)  DrawUpgradeScreen();
                 if (state == ST_GAMEOVER) DrawGameOver();
-                DrawPanel();
                 DrawCrosshair();
             EndMode2D();
 
