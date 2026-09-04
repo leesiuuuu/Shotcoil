@@ -147,7 +147,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>$(RaylibDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -156,8 +156,16 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- 제출본만 Windows 서브시스템이다. Console로 두면 Shotcoil.exe를 더블클릭할
+           때 게임 창 뒤로 검은 콘솔이 같이 떠서 raylib 로그가 흐른다 - 심사자가
+           가장 먼저 보는 화면이 그것이면 곤란하다. 진입점은 여전히 main()이므로
+           EntryPointSymbol로 mainCRTStartup을 직접 지정한다 (WinMain 불필요).
+           Debug는 Console 그대로다 - 캡처 모드 플래그들이 stdout으로 말을
+           걸어야 한다. -->
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <!-- 끄면 실행파일에 박히는 PDB 절대경로(개발 PC의 폴더 구조)도 같이 빠진다. -->
+      <GenerateDebugInformation>false</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(RaylibDir)lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>raylib.lib;opengl32.lib;gdi32.lib;winmm.lib;shell32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>

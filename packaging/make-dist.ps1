@@ -50,5 +50,8 @@ if ($total -gt $limit) {
 
 Write-Host '== 압축 =='
 if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+# 폴더째 압축한다. 내용물만 담으면 압축을 푼 사람의 바탕화면에 파일 세 개가
+# 그대로 쏟아지는 도구가 있다 - 받는 쪽이 어떤 프로그램을 쓰든 Shotcoil\ 하나로
+# 떨어지는 편이 안전하다.
+Compress-Archive -Path $stage -DestinationPath $zip
 Write-Host ('완료: {0}' -f $zip)
