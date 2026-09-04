@@ -279,6 +279,9 @@ typedef struct Player {
     float   swingT;         /* katana swing animation, counts down */
     int     swingSide;      /* alternates so consecutive slashes mirror */
     float   shieldFlash;    /* AEGIS: counts down after a hit was negated */
+    float   aegisCd;        /* AEGIS: locked out until this reaches zero  */
+    float   stealCd;        /* LIFESTEAL lockout                          */
+    float   thornCd;        /* THORNS lockout - separate on purpose       */
     float   blastT;         /* BACKBLAST ring throttle - purely cosmetic      */
     /* How long the shot-linked augment rings stay up after firing. `muzzle` is
        0.07s - long enough for a flash, far too short to read a range circle
@@ -551,6 +554,17 @@ static void ApplyCursorMode(void)
         HideCursor();       /* ...but still hide it, we draw our own crosshair */
         cursorLocked = false;
     }
+}
+
+/* Shared by the F11/Alt+Enter shortcut and the settings screen's toggle -
+   one place that flips `fullscreen`, so the two can never disagree about
+   which mode the window is actually in. */
+static void ToggleFullscreenMode(void)
+{
+    ToggleBorderlessWindowed();
+    fullscreen = !fullscreen;
+    UpdateViewport();
+    ApplyCursorMode();
 }
 
 static void UpdateAimCursor(void)
@@ -890,8 +904,181 @@ static float      questHold;
 #define QUEST_FAIL_HOLD  2.0f
 #define QUEST_FAIL_FADE  0.5f       /* the tail of the hold, spent fading out */
 
+/* What failing one costs: attack power, for the REST OF THE CURRENT WAVE
+   only. The wave scaling is why this is safe to impose at all - at wave 3
+   it is -10% for ninety seconds, which is a wince; at wave 40 it is -26%,
+   which is a wave you have to fight your way out of.
+ *
+ * It expires at the next StartWave rather than persisting, and that is the
+ * whole design. A permanent debuff on Q_NOHIT would mean getting hit makes
+ * you weaker makes you get hit - the run would enter a spiral it has no way
+ * to climb out of, and the challenge would stop being something you can
+ * decide to chase and start being a tax on playing badly. One wave is long
+ * enough to hurt and short enough to answer. */
+#define QUEST_FAIL_BASE  0.10f      /* -10% at the first challenge wave */
+#define QUEST_FAIL_STEP  0.004f     /* +0.4 points a wave after that    */
+#define QUEST_FAIL_CAP   0.30f
+static float questPenalty;          /* 0.10 == attack power x0.90       */
+
 #define QUEST_EVERY     3           /* one wave in three carries a challenge */
 #define QUEST_LONGSHOT  520.0f      /* what counts as "far" for Q_LONGSHOT   */
+
+/* ---- wave mutators (변칙) ----------------------------------------------- */
+/* The problem these exist to solve: past the twenties the only thing still
+   moving is enemy HEALTH (see SpawnEnemy), and health only makes a wave
+   LONGER, never more dangerous. Enemy speed caps around wave 16, the spawn
+   counts saturate by 12, and contact damage was a flat one heart forever.
+   Meanwhile the player picks a compounding upgrade every other wave and is
+   handed +2 HP on every boss. So wave 35 was wave 20 with more chewing.
+ *
+ * A mutator is a rule change laid over one wave. It is NOT optional: the run
+ * gets harder on a schedule the player cannot decline, the same way the wave
+ * number itself is not negotiable. Clearing one pays a reroll and a permanent
+ * slice of attack power - the reward for surviving it, not a bribe for
+ * accepting it.
+ *
+ * THE TABLE LEANS ENEMY-SIDE ON PURPOSE. A wave that is hard because the
+ * enemies are stronger reads as a harder wave; a wave that is hard because
+ * your own gun got worse reads as the game taking the controls away. The
+ * player-side entries are kept anyway - and weighted well below the others -
+ * because this game is about how you fly, and a table that only ever buffs
+ * enemies never once asks you to fly differently. */
+typedef enum MutatorId {
+    /* ---- enemy-side (the default direction) ---- */
+    MUT_SWIFT,          /* everything comes at you faster                     */
+    MUT_BARRAGE,        /* every enemy clock runs fast - shots and telegraphs */
+    MUT_WARD,           /* a flat share of your damage simply does not land   */
+    MUT_SAVAGE,         /* contact costs two hearts                           */
+    /* ---- player-side (rarer) ---- */
+    MUT_GRAVITY,        /* fall harder - you cannot coast between shots       */
+    MUT_RECOIL,         /* every shot overshoots; the walls do the rest       */
+    MUT_SLOWBULLET,     /* shots crawl - lead your targets                    */
+    MUT_HEAVYSHOT,      /* far fewer shots, so each one has to do both jobs   */
+    MUT_SCORCH,         /* the floor stops being a place                      */
+    MUT_HALVED,         /* the build you spent the run assembling, halved     */
+    MUT_COUNT
+} MutatorId;
+
+typedef struct MutatorDef {
+    const char *name;
+    const char *desc;   /* one short measurement, see below */
+    int         weight; /* relative odds of being rolled */
+    Color       color;
+} MutatorDef;
+
+/* The description is ONE short measurement, not a sentence. UISize snaps text
+   to whole multiples of a 14 real-pixel grid, so a size-20 line is 14 virtual
+   units wide per step at window scale 1 and 21 at scale 2 - half again - and
+   anything conversational here ran through the column divider at the larger
+   rungs. The name carries the flavour; this line carries the number.
+
+   Weights: the four enemy rules sum to 360 against 208 for the six player
+   ones, so roughly three waves in five change the enemies rather than you.
+   능력 반감 is the outlier at 18 - far and away the harshest entry, and at
+   anything like an even share it would be the reason most runs end. */
+static const MutatorDef MUTATORS[MUT_COUNT] = {
+    /* name           desc                 odds  colour */
+    { "적 가속",      "적 이동 x1.4",       100, { 255, 170,  90, 255 } },
+    { "적 연사",      "적 공격속도 x1.5",    95, { 255, 120, 160, 255 } },
+    { "적 방벽",      "피해 30% 무효",       85, { 140, 200, 255, 255 } },
+    { "적 흉포화",    "접촉 피해 2배",       80, { 255,  90, 110, 255 } },
+    { "중력 폭주",    "중력 x1.35",          45, { 150, 170, 255, 255 } },
+    { "반동 폭주",    "반동 x1.75",          45, { 190, 150, 255, 255 } },
+    { "느린 탄",      "탄속 x0.55",          40, { 120, 235, 255, 255 } },
+    { "한 발의 무게", "연사 간격 x1.35",     40, { 255, 225, 120, 255 } },
+    { "바닥 초토화",  "지면 인내 x0.4",      40, { 255, 140,  80, 255 } },
+    { "능력 반감",    "공격력·탄속·크기 1/2", 18, { 200, 200, 215, 255 } }
+};
+
+#define MUT_SWIFT_MUL    1.40f
+#define MUT_BARRAGE_MUL  1.50f
+#define MUT_WARD_CHANCE  0.30f
+#define MUT_SAVAGE_DMG   2
+#define MUT_SAVAGE_MERCY 1.55f    /* longer i-frames, or two hearts go at once */
+
+/* THE THRUST BUDGET IS WHY THESE TWO ARE NOT BIGGER NUMBERS.
+ *
+ * Sustained upward acceleration is one impulse per fire interval: on the
+ * pistol that is 460 * 0.92 every 0.32 * 0.86 seconds, about 1540 px/s^2
+ * against a gravity of 900. So the player only ever has ~640 px/s^2 of climb
+ * to spend, and BOTH of these spend it - one by raising the floor, the other
+ * by cutting how often you can push off it.
+ *
+ * At the 1.6 both started on, gravity became 1440 (climb: 98) and the fire
+ * interval left 960 (climb: 60). That is not a hard wave, it is a wave where
+ * the game stops answering the mouse - you sink whatever you do. At 1.35 each
+ * leaves roughly half the climb rate, which reads as heavy rather than broken.
+ * RollMutators additionally never rolls both at once; see MutThrustRule.
+ *
+ * The same budget is why 능력 반감 does NOT touch fire rate or recoil. Those
+ * two ARE the flight controls - halving either grounds the player outright -
+ * so that entry halves what the shots DO instead of how often they happen. */
+#define MUT_GRAV_MUL     1.35f
+#define MUT_RECOIL_MUL   1.75f
+/* Recoil sends you further, and this lets it carry: airDrag is per-60th-of-a-
+   second retention, so 0.990 -> 0.995 roughly doubles how long a shove lasts.
+   Overshooting into a wall is the risk this one sells. */
+#define MUT_RECOIL_DRAG  0.995f   /* replaces airDrag outright, not a factor  */
+#define MUT_SLOW_MUL     0.55f
+#define MUT_HEAVY_MUL    1.35f
+#define MUT_SCORCH_MUL   0.40f
+#define MUT_HALVED_MUL   0.50f
+
+/* Not before 8: the opening waves are the tutorial, and a run that has not
+   been handed any upgrades yet has no answer to any of these. From 25, two at
+   once - one mutator is a texture change, two interact. From 40 they arrive
+   every other wave instead of every third, which is where the roster and the
+   spawn caps have nothing new left to say. Boss waves never carry one: a boss
+   is already the wall of its five-wave block. */
+#define MUT_FROM_WAVE    8
+#define MUT_DOUBLE_WAVE  25
+#define MUT_DENSE_WAVE   40
+#define MUT_MAX_ACTIVE   2
+
+/* What surviving one is worth, per rule in force. Two stacks is +6% attack
+   power against the +3% a plain clear pays, and it is PERMANENT - which is
+   what lets a run that keeps meeting mutators compound the way the upgrade
+   cards do. The reroll is the other half; see the clear handler. */
+#define DMG_MUTATOR      2
+
+static bool mutOn[MUT_COUNT];        /* rules in force for the wave being played */
+static bool mutArmed[MUT_COUNT];     /* rolled during the pause, live next wave  */
+static int  mutNext[MUT_MAX_ACTIVE]; /* the same set in roll order, for the UI   */
+static int  mutNextCount;
+static int  mutCount;                /* how many of mutOn[] are true             */
+static float mutBannerT;             /* announcement under the wave number       */
+
+/* The physics reads these instead of `tune` directly. Kept as functions rather
+   than a mutated copy of the Tunables so the tuning baseline stays the one
+   thing on screen in a normal wave, and so nothing can leak a mutator into the
+   next wave by forgetting to restore a field. */
+static float MutGravity(void)    { return tune.gravity * (mutOn[MUT_GRAVITY] ? MUT_GRAV_MUL : 1.0f); }
+static float MutAirDrag(void)    { return mutOn[MUT_RECOIL] ? MUT_RECOIL_DRAG : tune.airDrag; }
+static float MutRecoilMul(void)  { return mutOn[MUT_RECOIL] ? MUT_RECOIL_MUL : 1.0f; }
+static float MutFireMul(void)    { return mutOn[MUT_HEAVYSHOT] ? MUT_HEAVY_MUL : 1.0f; }
+static float MutGroundMul(void)  { return mutOn[MUT_SCORCH] ? MUT_SCORCH_MUL : 1.0f; }
+static int   MutContactDmg(void) { return mutOn[MUT_SAVAGE] ? MUT_SAVAGE_DMG : 1; }
+static float MutMercy(void)      { return mutOn[MUT_SAVAGE] ? MUT_SAVAGE_MERCY : 1.3f; }
+
+/* 능력 반감 rides along on the stat multipliers it halves; bullet speed is
+   shared with 느린 탄, so the two compound if they ever land together. */
+static float MutHalvedMul(void)  { return mutOn[MUT_HALVED] ? MUT_HALVED_MUL : 1.0f; }
+static float MutBulletMul(void)  { return (mutOn[MUT_SLOWBULLET] ? MUT_SLOW_MUL : 1.0f)
+                                        * MutHalvedMul(); }
+
+/* Enemy-side. MutEnemySpeed scales the one place enemy position is integrated,
+   MutEnemyRate the one place their clocks tick - so a new enemy kind picks
+   both up for free instead of needing a per-behaviour patch. */
+static float MutEnemySpeed(void) { return mutOn[MUT_SWIFT]   ? MUT_SWIFT_MUL   : 1.0f; }
+static float MutEnemyRate(void)  { return mutOn[MUT_BARRAGE] ? MUT_BARRAGE_MUL : 1.0f; }
+
+/* Whichever rule is lowest in the enum - only used to pick ONE colour for the
+   shared banner, so any stable choice would do. */
+static int MutFirst(void)
+{
+    for (int i = 0; i < MUT_COUNT; i++) if (mutOn[i]) return i;
+    return 0;
+}
 
 #define REROLL_START      2
 #define REROLL_PER_BOSS   1
@@ -924,15 +1111,21 @@ static float RecoilMulAt(int n)  { return 1.0f + 0.12f * n; }
 static float SizeMulAt(int n)    { return 1.0f + 0.30f * n; }
 static float SpeedMulAt(int n)   { return 1.0f + 0.20f * n; }
 static float ScoreMulAt(int n)   { return 1.0f + 0.30f * n; }
-static float GroundTimeAt(int n) { return tune.groundTime + 0.6f * n; }
+static float GroundTimeAt(int n) { return (tune.groundTime + 0.6f * n) * MutGroundMul(); }
 static float BlastRadiusAt(int n){ return 62.0f + 26.0f * n; }
 
 static float UpFireMul(void)    { return FireMulAt(upStacks[UP_RAPID]); }
 static float UpDamageMul(void)  { return DamageMulAt(upStacks[UP_CALIBER]); }
 static float UpRecoilMul(void)  { return RecoilMulAt(upStacks[UP_RECOIL]); }
-static float UpSizeMul(void)    { return SizeMulAt(upStacks[UP_BIGSHOT]); }
+/* 능력 반감 (MUT_HALVED) rides these two as well as the damage multiplier
+   above and the bullet speed inside MutBulletMul. Fire rate and recoil are
+   pointedly absent: they are the flight controls, and halving either one
+   drops sustained thrust below gravity - see the thrust-budget note by the
+   mutator table. Halving what a shot DOES is a hard wave; halving how often
+   you can shoot is a wave you fall through. */
+static float UpSizeMul(void)    { return SizeMulAt(upStacks[UP_BIGSHOT]) * MutHalvedMul(); }
 static float UpSpeedMul(void)   { return SpeedMulAt(upStacks[UP_VELOCITY]); }
-static float UpScoreMul(void)   { return ScoreMulAt(upStacks[UP_GREED]); }
+static float UpScoreMul(void)   { return ScoreMulAt(upStacks[UP_GREED]) * MutHalvedMul(); }
 static float UpGroundTime(void) { return GroundTimeAt(upStacks[UP_ASBESTOS]); }
 
 /* Attack power earned by clearing waves, on top of whatever the build bought.
@@ -1011,9 +1204,15 @@ static float FocusMul(void)
 
 /* Every shot the player fires goes through this - the build, the clears and
    the two player-state augments multiply rather than any replacing another. */
+/* The debuff a failed challenge leaves behind, as a multiplier. Folded into
+   PlayerDamageMul so every damage source in the game pays it at once - a
+   beam, a blast and a stray pellet all weaken together. */
+static float QuestPenaltyMul(void) { return 1.0f - questPenalty; }
+
 static float PlayerDamageMul(void)
 {
-    return UpDamageMul() * EarnedDamageMul() * UpdraftMul() * FrenzyMul();
+    return UpDamageMul() * EarnedDamageMul() * UpdraftMul() * FrenzyMul()
+         * QuestPenaltyMul() * MutHalvedMul();
 }
 
 /* SNIPER: scales with how far THIS shot has actually flown. Resolved where the
@@ -1065,6 +1264,45 @@ static bool RollChance(float p)
 static float AegisChance(void)      { return StackChance(upStacks[UP_AEGIS],     AEGIS_PER_STACK); }
 static float ThornsHealChance(void) { return StackChance(upStacks[UP_THORNS],    THORNS_HEAL_PER); }
 static float LifestealChance(void)  { return StackChance(upStacks[UP_LIFESTEAL], LIFESTEAL_PER_STACK); }
+
+/* ---- cooldowns on the two things that undo damage ----
+ *
+ * The odds above approach a ceiling and never reach certainty, which was
+ * supposed to be enough. It is not, because the ROLL RATE is unbounded: a
+ * crowded late wave throws hits at you several times a second and a wide
+ * weapon kills several enemies a second, so a 50% negate and a 15% heal
+ * both fire constantly at exactly the moment they should be scarce. That is
+ * how a deep run stops being able to die.
+ *
+ * A cooldown fixes the rate directly: the chance still decides WHETHER the
+ * next eligible hit is negated, the cooldown decides HOW OFTEN there can be
+ * a next one. Extra stacks buy the cooldown down as well as the odds up, so
+ * a card is still worth taking twice.
+ *
+ * LIFESTEAL and THORNS get one clock each rather than a shared one. A build
+ * that spends two of its card slots on healing should heal more often than
+ * one that spent a single slot - and the alternative needed the cards to
+ * SAY they shared a clock, which is a sentence neither card has room for at
+ * a window scale of 1 (see the note on MUTATORS about UISize). */
+#define AEGIS_CD_BASE   6.0f
+#define AEGIS_CD_STEP   0.7f    /* per stack past the first */
+#define AEGIS_CD_MIN    3.0f
+#define HEAL_CD_BASE    9.0f
+#define HEAL_CD_STEP    0.9f
+#define HEAL_CD_MIN     4.5f
+
+static float CooldownFor(int stacks, float base, float step, float floorSec)
+{
+    float cd = base - step * (float)(stacks > 0 ? stacks - 1 : 0);
+    return (cd < floorSec) ? floorSec : cd;
+}
+
+static float AegisCooldown(void) { return CooldownFor(upStacks[UP_AEGIS],
+                                                      AEGIS_CD_BASE, AEGIS_CD_STEP, AEGIS_CD_MIN); }
+static float StealCooldown(void) { return CooldownFor(upStacks[UP_LIFESTEAL],
+                                                      HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN); }
+static float ThornCooldown(void) { return CooldownFor(upStacks[UP_THORNS],
+                                                      HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN); }
 
 /* BACKBLAST rides the recoil, so a heavier gun throws a heavier wave. That
    keeps it worth roughly the same on an SMG as on a BAZOOKA. */
@@ -1134,25 +1372,40 @@ static const char *UpgradeValue(int id)
                                          BlastRadiusAt(n), BlastRadiusAt(n + 1));
 
         /* Chance upgrades name what the odds measure - on THORNS the number is
-           the heal, not the blast, and a bare "26%" would not say which. */
+           the heal, not the blast, and a bare "26%" would not say which.
+
+           All three now carry a cooldown as well, and a stack buys both ends:
+           better odds AND a shorter lockout. Both have to be on the card, which
+           is why the arrow loses its spaces and its second "%" here - the long
+           form ran past the card edge at a window scale of 2, where UISize
+           renders this line half again as wide (see the note on MUTATORS). */
         case UP_AEGIS:
             return (n <= 0)
-                ? TextFormat("무력화 %.0f%%", StackChance(1, AEGIS_PER_STACK) * 100.0f)
-                : TextFormat("무력화 %.0f%% → %.0f%%",
+                ? TextFormat("무력화 %.0f%%  ·  %.1f초",
+                             StackChance(1, AEGIS_PER_STACK) * 100.0f,
+                             CooldownFor(1, AEGIS_CD_BASE, AEGIS_CD_STEP, AEGIS_CD_MIN))
+                : TextFormat("무력화 %.0f→%.0f%%  ·  %.1f초",
                              StackChance(n,     AEGIS_PER_STACK) * 100.0f,
-                             StackChance(n + 1, AEGIS_PER_STACK) * 100.0f);
+                             StackChance(n + 1, AEGIS_PER_STACK) * 100.0f,
+                             CooldownFor(n + 1, AEGIS_CD_BASE, AEGIS_CD_STEP, AEGIS_CD_MIN));
         case UP_THORNS:
             return (n <= 0)
-                ? TextFormat("회복 %.0f%%", StackChance(1, THORNS_HEAL_PER) * 100.0f)
-                : TextFormat("회복 %.0f%% → %.0f%%",
+                ? TextFormat("회복 %.0f%%  ·  %.1f초",
+                             StackChance(1, THORNS_HEAL_PER) * 100.0f,
+                             CooldownFor(1, HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN))
+                : TextFormat("회복 %.0f→%.0f%%  ·  %.1f초",
                              StackChance(n,     THORNS_HEAL_PER) * 100.0f,
-                             StackChance(n + 1, THORNS_HEAL_PER) * 100.0f);
+                             StackChance(n + 1, THORNS_HEAL_PER) * 100.0f,
+                             CooldownFor(n + 1, HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN));
         case UP_LIFESTEAL:
             return (n <= 0)
-                ? TextFormat("회복 %.0f%%", StackChance(1, LIFESTEAL_PER_STACK) * 100.0f)
-                : TextFormat("회복 %.0f%% → %.0f%%",
+                ? TextFormat("회복 %.0f%%  ·  %.1f초",
+                             StackChance(1, LIFESTEAL_PER_STACK) * 100.0f,
+                             CooldownFor(1, HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN))
+                : TextFormat("회복 %.0f→%.0f%%  ·  %.1f초",
                              StackChance(n,     LIFESTEAL_PER_STACK) * 100.0f,
-                             StackChance(n + 1, LIFESTEAL_PER_STACK) * 100.0f);
+                             StackChance(n + 1, LIFESTEAL_PER_STACK) * 100.0f,
+                             CooldownFor(n + 1, HEAL_CD_BASE, HEAL_CD_STEP, HEAL_CD_MIN));
 
         case UP_PIERCE:  return TextFormat("관통 %d → %d",   n, n + 1);
         case UP_HOMING:  return TextFormat("추적 %d → %d",   n, n + 1);
@@ -1233,6 +1486,100 @@ static void RollUpgrades(void)
 
         upChoices[slot] = cand[pick];
         cand[pick] = cand[--n];             /* drawn without replacement */
+    }
+}
+
+/* The mutator offer for the wave AFTER the one just cleared. Called from the
+   same place RollUpgrades is, and only from there: the offer belongs to the
+   screen, so a re-roll of the cards must not quietly re-roll the gamble the
+   player has already been reading.
+
+   MUT_SLOWBULLET is withheld from a hitscan build. The railgun and the laser
+   have no projectile to slow down, so on those two it is a free +12% attack
+   power - an offer that is not a risk teaches the player to stop reading the
+   offers at all. */
+/* GRAVITY raises what you have to beat, HEAVYSHOT cuts how often you get to
+   push against it, and they are drawn from the same budget - together they
+   take the player's ability to stay airborne away entirely. Everything else
+   in the table stacks fine, so this is a rule about these two rather than a
+   general conflict system. */
+static bool MutThrustRule(int id)
+{
+    return id == MUT_GRAVITY || id == MUT_HEAVYSHOT;
+}
+
+/* How many rules wave `n` carries. The whole schedule lives here so the roll,
+   the forecast on the upgrade screen and the payout all read the same source
+   instead of each re-deriving it. */
+static int MutSlotsFor(int n)
+{
+    if (n < MUT_FROM_WAVE) return 0;
+    if (n % 5 == 0)        return 0;    /* a boss is already that block's wall */
+
+    /* Every third wave to begin with, every other wave from 40. `2 % every`
+       is just the phase that keeps the first mutator wave on 8. */
+    int  every = (n >= MUT_DENSE_WAVE) ? 2 : 3;
+    int  phase = 2 % every;
+    bool due   = (n % every == phase);
+
+    /* A slot that lands on a boss wave SLIDES to the wave after it rather than
+       being dropped. The two cycles collide every fifteen waves (20, 35, 50),
+       and simply skipping left a five-wave lull each time - 33 through 37 with
+       nothing, in exactly the stretch this system exists to fill. */
+    if (!due && (n - 1) % 5 == 0 && (n - 1) % every == phase) due = true;
+    if (!due) return 0;
+
+    return (n >= MUT_DOUBLE_WAVE) ? MUT_MAX_ACTIVE : 1;
+}
+
+/* Rolls the rules for the wave AFTER the one just cleared and arms them.
+   Called once from the pause between waves, so the upgrade screen (when there
+   is one) can show the player what is coming while they pick a card.
+
+   MUT_SLOWBULLET is withheld from a hitscan build. The railgun and the laser
+   have no projectile to slow down, so on those two it is a wave that says it
+   got harder and did not - and a rule the player learns to ignore is worse
+   than no rule. */
+static void RollMutators(void)
+{
+    int next = wave + 1;
+
+    mutNextCount = 0;
+    for (int i = 0; i < MUT_MAX_ACTIVE; i++) mutNext[i] = -1;
+    memset(mutArmed, 0, sizeof(mutArmed));
+
+    int want = MutSlotsFor(next);
+    if (want <= 0) return;
+
+    int cand[MUT_COUNT], n = 0;
+    for (int i = 0; i < MUT_COUNT; i++)
+    {
+        if (i == MUT_SLOWBULLET && WEAPONS[player.weapon].hitscan) continue;
+        cand[n++] = i;
+    }
+
+    for (int slot = 0; slot < want && n > 0; slot++)
+    {
+        int total = 0;
+        for (int i = 0; i < n; i++) total += MUTATORS[cand[i]].weight;
+
+        int roll = GetRandomValue(0, total - 1);
+        int pick = n - 1;                   /* also the guard if weights are odd */
+        for (int i = 0; i < n; i++)
+        {
+            roll -= MUTATORS[cand[i]].weight;
+            if (roll < 0) { pick = i; break; }
+        }
+
+        int id = cand[pick];
+        mutNext[mutNextCount++] = id;
+        mutArmed[id] = true;
+        cand[pick] = cand[--n];             /* drawn without replacement */
+
+        /* Rolling one thrust rule closes the door on the other. */
+        if (MutThrustRule(id))
+            for (int i = 0; i < n; i++)
+                if (MutThrustRule(cand[i])) { cand[i] = cand[--n]; i--; }
     }
 }
 
@@ -1346,6 +1693,335 @@ static void ShutdownSfx(void)
     UnloadPool(&sfxBoom);   UnloadPool(&sfxHurt);  UnloadPool(&sfxReload);
     UnloadPool(&sfxWave);   UnloadPool(&sfxWarn);
     CloseAudioDevice();
+}
+
+/*----------------------------------------------------------------------------*/
+/* Music - two chiptune loops, rendered a buffer at a time                    */
+/*----------------------------------------------------------------------------*/
+/* The size limit rules out an audio file. Even a thin 30-second mono OGG eats
+   the whole remaining headroom, and it would buy a loop the player hears forty
+   times a run. So the music is synthesised like everything else here - except
+   a song is far too long to hold as one Wave, so it is rendered a chunk at a
+   time into a streaming buffer instead.
+ *
+ * The voice set is the NES's on purpose: two pulses, a triangle bass, and one
+ * noise channel doing the drums. Four voices is not a restriction being worked
+ * around - it is the sound. */
+#define MUS_RATE    22050
+#define MUS_CHUNK   1024        /* frames per refill - 46ms at this rate */
+#define MUS_STEPS   128         /* sixteenth notes in one loop, either song */
+
+/* Pattern bytes: 0 leaves the voice alone, 1 cuts it, anything else is a MIDI
+   note. A rest is written as an explicit cut so that "hold" and "silence" can
+   never be the same byte - that is the bug that makes a hand-typed pattern
+   sound like it has a wrong note when it actually has a missing one. */
+
+static const unsigned char TITLE_LEAD[MUS_STEPS] = {
+    /* Am */ 69,0,0,0, 72,0,0,0, 76,0,0,0,  0,0,0,0,
+    /* F  */ 74,0,0,0, 72,0,0,0, 69,0,0,0,  0,0,0,0,
+    /* C  */ 76,0,0,0, 79,0,0,0, 76,0,0,0,  0,0,0,0,
+    /* G  */ 74,0,0,0,  0,0,0,0, 71,0,0,0,  0,0,0,0,
+    /* Am */ 69,0,0,0, 72,0,0,0, 76,0,0,0, 81,0,0,0,
+    /* F  */ 79,0,0,0,  0,0,0,0, 77,0,0,0,  0,0,0,0,
+    /* E  */ 76,0,0,0, 74,0,0,0, 72,0,0,0, 71,0,0,0,
+    /* Am */ 69,0,0,0,  0,0,0,0,  0,0,0,0,  1,0,0,0
+};
+static const unsigned char TITLE_HARM[MUS_STEPS] = {
+    57,0,60,0, 64,0,60,0, 57,0,60,0, 64,0,60,0,
+    53,0,57,0, 60,0,57,0, 53,0,57,0, 60,0,57,0,
+    52,0,55,0, 60,0,55,0, 52,0,55,0, 60,0,55,0,
+    55,0,59,0, 62,0,59,0, 55,0,59,0, 62,0,59,0,
+    57,0,60,0, 64,0,60,0, 57,0,60,0, 64,0,60,0,
+    53,0,57,0, 60,0,57,0, 53,0,57,0, 60,0,57,0,
+    52,0,56,0, 59,0,56,0, 52,0,56,0, 59,0,56,0,
+    57,0,60,0, 64,0,60,0, 57,0,60,0, 64,0, 1,0
+};
+static const unsigned char TITLE_BASS[MUS_STEPS] = {
+    45,0,0,0,0,0,0,0, 45,0,0,0,0,0,0,0,
+    41,0,0,0,0,0,0,0, 41,0,0,0,0,0,0,0,
+    48,0,0,0,0,0,0,0, 48,0,0,0,0,0,0,0,
+    43,0,0,0,0,0,0,0, 43,0,0,0,0,0,0,0,
+    45,0,0,0,0,0,0,0, 45,0,0,0,0,0,0,0,
+    41,0,0,0,0,0,0,0, 41,0,0,0,0,0,0,0,
+    40,0,0,0,0,0,0,0, 40,0,0,0,0,0,0,0,
+    45,0,0,0,0,0,0,0, 45,0,0,0, 1,0,0,0
+};
+
+static const unsigned char BATTLE_LEAD[MUS_STEPS] = {
+    /* Am */ 69,0,72,0, 76,0,72,0, 69,0,76,0, 72,0,69,0,
+    /* Am */ 81,0,79,0, 76,0,72,0, 76,0,72,0, 69,0,67,0,
+    /* F  */ 77,0,72,0, 69,0,72,0, 77,0,81,0, 77,0,72,0,
+    /* G  */ 79,0,74,0, 71,0,74,0, 79,0,83,0, 79,0,74,0,
+    /* Am */ 69,0,72,0, 76,0,72,0, 69,0,76,0, 72,0,69,0,
+    /* Am */ 81,0,79,0, 77,0,76,0, 74,0,72,0, 71,0,69,0,
+    /* F  */ 77,0,81,0, 84,0,81,0, 77,0,72,0, 77,0,81,0,
+    /* E  */ 83,0,80,0, 76,0,71,0, 76,0,80,0, 83,0, 1,0
+};
+static const unsigned char BATTLE_HARM[MUS_STEPS] = {
+    0,0,64,0, 0,0,64,0, 0,0,64,0, 0,0,64,0,
+    0,0,64,0, 0,0,69,0, 0,0,64,0, 0,0,69,0,
+    0,0,60,0, 0,0,60,0, 0,0,60,0, 0,0,65,0,
+    0,0,62,0, 0,0,62,0, 0,0,62,0, 0,0,67,0,
+    0,0,64,0, 0,0,64,0, 0,0,64,0, 0,0,64,0,
+    0,0,64,0, 0,0,69,0, 0,0,64,0, 0,0,69,0,
+    0,0,60,0, 0,0,65,0, 0,0,60,0, 0,0,65,0,
+    0,0,59,0, 0,0,64,0, 0,0,59,0, 0,0, 1,0
+};
+static const unsigned char BATTLE_BASS[MUS_STEPS] = {
+    45,0,45,0, 57,0,45,0, 45,0,45,0, 57,0,45,0,
+    45,0,45,0, 57,0,45,0, 45,0,45,0, 57,0,45,0,
+    41,0,41,0, 53,0,41,0, 41,0,41,0, 53,0,41,0,
+    43,0,43,0, 55,0,43,0, 43,0,43,0, 55,0,43,0,
+    45,0,45,0, 57,0,45,0, 45,0,45,0, 57,0,45,0,
+    45,0,45,0, 57,0,45,0, 45,0,45,0, 57,0,45,0,
+    41,0,41,0, 53,0,41,0, 41,0,41,0, 53,0,41,0,
+    40,0,40,0, 52,0,40,0, 40,0,40,0, 52,0, 1,0
+};
+
+/* Drums repeat every bar, so they are stored as one bar rather than 128 bytes
+   of the same four hits. 1 kick, 2 snare, 3 hat. The fill lands on the fourth
+   and eighth bars - the two places the loop would otherwise start to be
+   audible as a loop. */
+static const unsigned char BATTLE_DRUM[16]     = { 1,3,3,3, 2,3,3,3, 1,3,1,3, 2,3,3,3 };
+static const unsigned char BATTLE_DRUMFILL[16] = { 1,3,3,3, 2,3,3,3, 1,3,2,3, 2,2,2,2 };
+
+typedef enum MusicTrack { MUS_OFF, MUS_TITLE, MUS_BATTLE, MUS_COUNT } MusicTrack;
+
+typedef struct MusSong {
+    float bpm;
+    const unsigned char *lead, *harm, *bass, *drum, *drumFill;
+} MusSong;
+
+static const MusSong SONGS[MUS_COUNT] = {
+    { 120.0f, NULL, NULL, NULL, NULL, NULL },
+    /* The title sits under a screen nobody is being asked to react to, so it
+       is slow and carries no drums at all. */
+    { 100.0f, TITLE_LEAD,  TITLE_HARM,  TITLE_BASS,  NULL,        NULL },
+    { 150.0f, BATTLE_LEAD, BATTLE_HARM, BATTLE_BASS, BATTLE_DRUM, BATTLE_DRUMFILL }
+};
+
+typedef struct MusVoice { float phase, freq, env, decay, duty; } MusVoice;
+
+static AudioStream musStream;
+static short       musBuf[MUS_CHUNK];
+static bool        musReady   = false;
+static bool        musEnabled = true;      /* M toggles it, from any screen */
+static MusicTrack  musTrack   = MUS_OFF;   /* what is sounding right now    */
+static MusicTrack  musWant    = MUS_OFF;   /* what the game state asks for  */
+static float       musGain    = 0.0f;      /* the crossfade between the two */
+static int         musStep    = 0;
+static int         musSamp    = 0;         /* samples left in the step */
+
+static MusVoice musP1, musP2, musTri;
+static struct {
+    float env, decay, phase, freq, lp, prev;
+    int   type;
+    unsigned int rng;
+} musDrum;
+
+static float MidiHz(unsigned char note)
+{
+    return 440.0f * powf(2.0f, ((float)note - 69.0f) / 12.0f);
+}
+
+static void MusNote(MusVoice *v, unsigned char code, float duty, float decay,
+                    bool resetPhase)
+{
+    if (code == 0) return;
+    if (code == 1) { v->env = 0.0f; return; }
+    v->freq  = MidiHz(code);
+    v->env   = 1.0f;
+    v->decay = decay;
+    v->duty  = duty;
+    if (resetPhase) v->phase = 0.0f;   /* on a pulse the click is the attack */
+}
+
+static void MusDrumHit(int type)
+{
+    musDrum.type  = type;
+    musDrum.env   = 1.0f;
+    musDrum.phase = 0.0f;
+    switch (type)
+    {
+        case 1:  musDrum.freq = 150.0f; musDrum.decay = 0.99970f; break;  /* kick  */
+        case 2:  musDrum.decay = 0.99930f;                        break;  /* snare */
+        default: musDrum.decay = 0.99750f;                        break;  /* hat   */
+    }
+}
+
+/* One sixteenth note of whichever song is playing. */
+static void MusAdvance(void)
+{
+    const MusSong *s = &SONGS[musTrack];
+    if (s->lead == NULL) return;
+
+    MusNote(&musP1,  s->lead[musStep], 0.50f, 0.99994f, true);
+    MusNote(&musP2,  s->harm[musStep], 0.25f, 0.99985f, true);
+    MusNote(&musTri, s->bass[musStep], 0.00f, 0.99992f, false);
+
+    if (s->drum != NULL)
+    {
+        int bar = musStep / 16;
+        const unsigned char *row = ((bar == 3 || bar == 7) && s->drumFill != NULL)
+                                 ? s->drumFill : s->drum;
+        int hit = row[musStep % 16];
+        if (hit != 0) MusDrumHit(hit);
+    }
+
+    musStep = (musStep + 1) % MUS_STEPS;
+}
+
+static float MusPulse(MusVoice *v)
+{
+    v->phase += v->freq / MUS_RATE;
+    if (v->phase >= 1.0f) v->phase -= 1.0f;
+    float s = (v->phase < v->duty) ? 1.0f : -1.0f;
+    v->env *= v->decay;
+    return s * v->env;
+}
+
+/* Quantised to sixteen levels, which is what the NES triangle actually does
+   and is why its bass has that faint buzz instead of sounding like a sine. */
+static float MusTriangle(MusVoice *v)
+{
+    v->phase += v->freq / MUS_RATE;
+    if (v->phase >= 1.0f) v->phase -= 1.0f;
+    float s = (v->phase < 0.5f) ? (4.0f * v->phase - 1.0f)
+                                : (3.0f - 4.0f * v->phase);
+    s = floorf(s * 8.0f) / 8.0f;
+    v->env *= v->decay;
+    return s * v->env;
+}
+
+static float MusDrumSample(void)
+{
+    musDrum.rng = musDrum.rng * 1664525u + 1013904223u;
+    float n = ((float)((musDrum.rng >> 9) & 0xFFFF) / 32767.5f) - 1.0f;
+    float s = 0.0f;
+
+    if (musDrum.type == 1)
+    {
+        musDrum.phase += musDrum.freq / MUS_RATE;
+        if (musDrum.phase >= 1.0f) musDrum.phase -= 1.0f;
+        musDrum.freq = fmaxf(42.0f, musDrum.freq * 0.99940f);
+        s = sinf(musDrum.phase * 2.0f * PI);
+    }
+    else if (musDrum.type == 2)
+    {
+        musDrum.lp += (n - musDrum.lp) * 0.55f;   /* body under the hiss */
+        s = musDrum.lp * 1.3f;
+    }
+    else if (musDrum.type == 3)
+    {
+        s = (n - musDrum.prev) * 0.5f;            /* first difference = bright */
+    }
+
+    musDrum.prev = n;
+    s *= musDrum.env;
+    musDrum.env *= musDrum.decay;
+    return s;
+}
+
+static void MusSilenceVoices(void)
+{
+    musP1.env = musP2.env = musTri.env = 0.0f;
+    musDrum.env  = 0.0f;
+    musDrum.type = 0;
+}
+
+static void MusRender(short *out, int frames)
+{
+    const float fadeOut = 1.0f / (0.22f * MUS_RATE);
+    const float fadeIn  = 1.0f / (0.45f * MUS_RATE);
+
+    for (int i = 0; i < frames; i++)
+    {
+        /* The hand-off happens here rather than on the game thread, so a track
+           change can never land in the middle of a sample. */
+        if (musTrack != musWant)
+        {
+            musGain -= fadeOut;
+            if (musGain <= 0.0f)
+            {
+                musGain  = 0.0f;
+                musTrack = musWant;
+                musStep  = 0;
+                musSamp  = 0;
+                MusSilenceVoices();
+            }
+        }
+        else if (musTrack != MUS_OFF && musGain < 1.0f)
+        {
+            musGain = fminf(1.0f, musGain + fadeIn);
+        }
+
+        if (musTrack == MUS_OFF) { out[i] = 0; continue; }
+
+        if (musSamp <= 0)
+        {
+            MusAdvance();
+            musSamp = (int)(MUS_RATE * 15.0f / SONGS[musTrack].bpm);
+        }
+        musSamp--;
+
+        float mix = MusPulse(&musP1)     * 0.20f
+                  + MusPulse(&musP2)     * 0.13f
+                  + MusTriangle(&musTri) * 0.26f
+                  + MusDrumSample()      * 0.22f;
+
+        mix *= musGain;
+        if (mix >  1.0f) mix =  1.0f;
+        if (mix < -1.0f) mix = -1.0f;
+        out[i] = (short)(mix * 30000.0f);
+    }
+}
+
+static void InitMusic(void)
+{
+    if (!audioReady) return;
+    SetAudioStreamBufferSizeDefault(MUS_CHUNK);
+    musStream = LoadAudioStream(MUS_RATE, 16, 1);
+    if (!IsAudioStreamValid(musStream)) return;
+
+    musReady    = true;
+    musDrum.rng = 0x9E3779B9u;
+    /* Under the effects, not beside them: the shot is the feedback the player
+       is actually listening for. */
+    SetAudioStreamVolume(musStream, 0.45f);
+    PlayAudioStream(musStream);
+}
+
+static void ShutdownMusic(void)
+{
+    if (!musReady) return;
+    StopAudioStream(musStream);
+    UnloadAudioStream(musStream);
+    musReady = false;
+}
+
+/* Which song the screen in front of the player should be playing. The help
+   page and the game-over screen keep the title theme - both are places where
+   the run is not happening, and both are read rather than played. */
+static MusicTrack MusicForState(void)
+{
+    if (!musEnabled) return MUS_OFF;
+    switch (state)
+    {
+        case ST_PLAY:
+        case ST_UPGRADE: return MUS_BATTLE;
+        default:         return MUS_TITLE;
+    }
+}
+
+static void UpdateMusic(void)
+{
+    if (!musReady) return;
+    musWant = MusicForState();
+    while (IsAudioStreamProcessed(musStream))
+    {
+        MusRender(musBuf, MUS_CHUNK);
+        UpdateAudioStream(musStream, musBuf, MUS_CHUNK);
+    }
 }
 
 /*----------------------------------------------------------------------------*/
@@ -1511,6 +2187,15 @@ static void QuestFail(void)
     questState = QS_FAILED;
     questFlash = 1.0f;
     questHold  = QUEST_FAIL_HOLD;
+
+    questPenalty = QUEST_FAIL_BASE + QUEST_FAIL_STEP * (float)wave;
+    if (questPenalty > QUEST_FAIL_CAP) questPenalty = QUEST_FAIL_CAP;
+
+    AddPopupEx((Vector2){ player.pos.x, player.pos.y - 52.0f }, 0,
+               TextFormat("도전 실패  공격력 -%.0f%%", questPenalty * 100.0f),
+               (Color){ 255, 110, 110, 255 });
+    AddShock(player.pos, 46.0f, (Color){ 255, 110, 110, 255 });
+    PlaySfx(&sfxWarn, 0.6f);
 }
 
 /* Called from KillEnemy for every kill the player earns. `dist` is how far the
@@ -1810,6 +2495,16 @@ static Enemy *SpawnEnemy(EnemyType type, Vector2 pos, int tier)
 
         float late = (float)wave - 16.0f;
         if (late > 0.0f) mul *= powf(1.035f, late);
+
+        /* And a third, steeper term from 40. By then the player has taken
+           twenty-odd upgrade picks, every one of them multiplying what the
+           last built on, plus a permanent slice of attack power from every
+           single wave clear - growth the 3.5% ramp above stopped tracking
+           somewhere in the thirties. 5.5% a wave puts wave 50 at roughly
+           27x a wave-8 body against the old 17x, which is what makes the
+           forties a climb again rather than a victory lap. */
+        float deep = (float)wave - 40.0f;
+        if (deep > 0.0f) mul *= powf(1.055f, deep);
 
         e->maxHp     *= mul;
         e->shieldMax *= mul;    /* zero for everything without a plate */
@@ -2124,9 +2819,11 @@ static void KillEnemy(Enemy *e, bool byPlayer)
 
     /* LIFESTEAL: every kill is its own roll. */
     {
-        if (player.hp < PlayerMaxHp() && RollChance(LifestealChance()))
+        if (player.stealCd <= 0.0f && player.hp < PlayerMaxHp() &&
+            RollChance(LifestealChance()))
         {
             player.hp++;
+            player.stealCd = StealCooldown();
             AddPopupEx(player.pos, 0, "체력 +1", (Color){ 120, 255, 210, 255 });
             PlaySfx(&sfxReload, 1.5f);
         }
@@ -2140,6 +2837,23 @@ static void DamageEnemy(Enemy *e, float dmg, Vector2 from)
        one death. Every caller filters on active already; this just makes the
        invariant impossible to break from a new one. */
     if (!e->active || e->spawnT > 0.0f) return;
+
+    /* MUT_WARD: a flat share of incoming damage simply does not land. Rolled
+       per damage instance rather than per shot, so a piercing round gets a
+       fresh roll on every body and a shotgun pattern is not all-or-nothing.
+       Loud on purpose - a hit that silently does nothing reads as the game
+       dropping the input, which is the same reason ShieldHit sparks. */
+    if (mutOn[MUT_WARD] && RollChance(MUT_WARD_CHANCE))
+    {
+        Vector2 off = Vector2Subtract(e->pos, from);
+        float   ang = (Vector2LengthSqr(off) > 0.0001f) ? atan2f(off.y, off.x) + PI
+                                                        : 0.0f;
+        e->guardT = 0.18f;
+        EmitBurst(Vector2Add(e->pos, FromAngle(ang, e->radius)), ang, 1.0f, 6,
+                  70.0f, 240.0f, 0.22f, 3.0f, MUTATORS[MUT_WARD].color, 90.0f);
+        PlaySfx(&sfxHit, 2.1f);
+        return;
+    }
 
     /* EXECUTE: a finisher, applied here rather than at the muzzle so it reads
        every source - a rocket, a beam and a stray pellet all execute. Bosses
@@ -2405,6 +3119,19 @@ static void StartWave(int n)
     waveBannerT = 1.6f;
     waveCleared = false;
 
+    /* Mutators are armed on the upgrade screen and cashed in here, once,
+       for exactly one wave. Promoting rather than reading `mutArmed` in
+       place is what guarantees a rule cannot leak into the wave after:
+       every StartWave overwrites the live set, including with nothing. */
+    mutCount = 0;
+    for (int i = 0; i < MUT_COUNT; i++)
+    {
+        mutOn[i]    = mutArmed[i];
+        mutArmed[i] = false;
+        if (mutOn[i]) mutCount++;
+    }
+    mutBannerT = (mutCount > 0) ? 2.6f : 0.0f;
+
     /* The pause that will follow THIS wave. Beating a boss earns a real
        breather rather than being thrown straight back into the grinder. */
     intermission = (n % 5 == 0) ? 5.0f : 1.2f;
@@ -2413,6 +3140,11 @@ static void StartWave(int n)
     /* One wave in three carries a challenge, and never a boss wave - a boss is
        already asking for the player's whole attention, and a second goal laid
        over it would only be noise. */
+    /* The failure debuff is scoped to one wave, and this is where that is
+       enforced - not in UpdateQuest, which would have to know whether the
+       wave had ended. */
+    questPenalty = 0.0f;
+
     if (n >= 3 && n % QUEST_EVERY == 0 && n % 5 != 0) StartQuest(n);
     else                                              questState = QS_NONE;
 
@@ -2601,6 +3333,27 @@ static void UpdateSpawning(float dt)
                         TextFormat("공격력 +%.0f%%",
                                    DMG_PER_STACK * DMG_WAVE_CLEAR * 100.0f));
 
+            /* A mutated wave pays on top of the ordinary clear: permanent
+               attack power per rule survived, and one reroll. The reroll
+               is the half that lands immediately - it is spendable on the
+               very next card screen, which is what makes a hard wave feel
+               like it bought something rather than merely cost time. */
+            if (mutCount > 0)
+            {
+                bool gotReroll = (rerolls < REROLL_MAX);
+                if (gotReroll) rerolls++;
+
+                GrantDamage(DMG_MUTATOR * mutCount,
+                            (Vector2){ player.pos.x, player.pos.y - 62.0f },
+                            gotReroll
+                                ? TextFormat("변칙 돌파  공격력 +%.0f%%  새로고침 +1",
+                                             DMG_PER_STACK * DMG_MUTATOR * mutCount * 100.0f)
+                                : TextFormat("변칙 돌파  공격력 +%.0f%%",
+                                             DMG_PER_STACK * DMG_MUTATOR * mutCount * 100.0f));
+                flashWhite = 0.3f;
+                AddShake(8.0f);
+            }
+
             if (bossWave)
             {
                 if (rerolls < REROLL_MAX)
@@ -2625,7 +3378,14 @@ static void UpdateSpawning(float dt)
         intermission -= dt;
         if (intermission <= 0.0f)
         {
-            score += (long)(250.0f * wave * UpScoreMul() * (bossWave ? 3.0f : 1.0f));
+            score += (long)(250.0f * wave * UpScoreMul() * (bossWave ? 3.0f : 1.0f)
+                                  * (1.0f + 0.6f * mutCount));
+
+            /* The next wave's rules are rolled here, before either branch,
+               because they are not a choice any more - the card screen only
+               gets to REPORT them, and a wave with no card screen still has
+               to arrive carrying them. */
+            RollMutators();
 
             /* Upgrades every other wave, and always after a boss. */
             if (wave % 2 == 0 || bossWave)
@@ -2650,10 +3410,11 @@ static void HurtPlayer(Vector2 from)
     /* AEGIS: rolled fresh on every incoming hit. When it lands the hit simply
        never happened - no health, no combo broken - and the short mercy window
        stops a crowd from rolling against you several times in one frame. */
-    if (RollChance(AegisChance()))
+    if (player.aegisCd <= 0.0f && RollChance(AegisChance()))
     {
         player.shieldFlash = 0.35f;
         player.invuln      = 0.35f;
+        player.aegisCd     = AegisCooldown();
 
         Vector2 push = Vector2Subtract(player.pos, from);
         if (Vector2LengthSqr(push) < 0.001f) push = (Vector2){ 0, -1 };
@@ -2669,8 +3430,12 @@ static void HurtPlayer(Vector2 from)
         return;
     }
 
-    player.hp--;
-    player.invuln = 1.3f;
+    /* MUT_SAVAGE takes two hearts a hit. The mercy window widens with it -
+       at the old 1.3s a crowd could take four of five hearts before you had
+       any say in it, which is a coin flip rather than a harder wave. */
+    player.hp -= MutContactDmg();
+    if (player.hp < 0) player.hp = 0;
+    player.invuln = MutMercy();
     player.combo  = 0;
 
     /* Only a hit that actually landed breaks it - an AEGIS negation returns
@@ -2706,9 +3471,11 @@ static void HurtPlayer(Vector2 from)
 
         /* ...and sometimes the blast gives the point back. Guarded on hp > 0
            so it can heal a wound but never undo a death. */
-        if (player.hp > 0 && player.hp < PlayerMaxHp() && RollChance(ThornsHealChance()))
+        if (player.thornCd <= 0.0f && player.hp > 0 && player.hp < PlayerMaxHp() &&
+            RollChance(ThornsHealChance()))
         {
             player.hp++;
+            player.thornCd = ThornCooldown();
             AddPopupEx(player.pos, 0, "체력 +1", (Color){ 255, 160, 220, 255 });
             PlaySfx(&sfxReload, 1.5f);
         }
@@ -2790,13 +3557,14 @@ static void FirePlayer(Vector2 target)
         if (w->hitscan) FireBeam(muzzle, FromAngle(a, 1.0f), w);
         else SpawnPlayerShot(muzzle,
                              Vector2Scale(FromAngle(a, 1.0f),
-                                          w->bulletSpeed * UpSpeedMul()
+                                          w->bulletSpeed * UpSpeedMul() * MutBulletMul()
                                                          * RandF(0.92f, 1.08f)), w);
     }
 
     player.vel = Vector2Add(player.vel,
                             Vector2Scale(shotDir,
-                                         -tune.recoilImpulse * w->recoilMul * UpRecoilMul()));
+                                         -tune.recoilImpulse * w->recoilMul * UpRecoilMul()
+                                                             * MutRecoilMul()));
 
     /* BACKBLAST: the recoil itself hurts whatever is behind you, which is
        exactly where you are about to fly away from. */
@@ -2823,7 +3591,7 @@ static void FirePlayer(Vector2 target)
         }
     }
 
-    player.cooldown  = tune.fireCooldown * w->cooldownMul * UpFireMul();
+    player.cooldown  = tune.fireCooldown * w->cooldownMul * UpFireMul() * MutFireMul();
     player.muzzle    = 0.07f;
     player.fireRingT = FIRE_RING_TIME;
     player.grounded = false;
@@ -2861,6 +3629,9 @@ static void UpdatePlayer(float dt)
     if (player.muzzle   > 0.0f) player.muzzle   -= dt;
     if (player.swingT   > 0.0f) player.swingT   -= dt;
     if (player.shieldFlash > 0.0f) player.shieldFlash -= dt;
+    if (player.aegisCd  > 0.0f) player.aegisCd  -= dt;
+    if (player.stealCd  > 0.0f) player.stealCd  -= dt;
+    if (player.thornCd  > 0.0f) player.thornCd  -= dt;
     if (player.blastT   > 0.0f) player.blastT   -= dt;
     if (player.fireRingT > 0.0f) player.fireRingT -= dt;
     if (player.comboFlash > 0.0f) player.comboFlash -= dt;
@@ -2884,8 +3655,8 @@ static void UpdatePlayer(float dt)
         FirePlayer(mouse);
 
     /* Integration */
-    player.vel.y += tune.gravity * dt;
-    player.vel = Vector2Scale(player.vel, powf(tune.airDrag, dt * 60.0f));
+    player.vel.y += MutGravity() * dt;
+    player.vel = Vector2Scale(player.vel, powf(MutAirDrag(), dt * 60.0f));
     player.pos = Vector2Add(player.pos, Vector2Scale(player.vel, dt));
 
     /* Arena collision - walls bounce, which is what makes trick shots exist. */
@@ -3004,6 +3775,14 @@ static void UpdateEnemies(float dt)
             continue;
         }
 
+        /* MUT_BARRAGE. Every `e->timer` / `e->timer2` countdown in the
+           behaviour switch below runs on this instead of dt, so one
+           constant speeds up every attack cadence, wind-up and recovery
+           in the game at once. Deliberately NOT applied to spawnT: the
+           telegraph that says a body is about to become solid is the
+           one clock the player must always get in full. */
+        float edt = dt * MutEnemyRate();
+
         Vector2 toPlayer = Vector2Subtract(player.pos, e->pos);
         float   dist     = Vector2Length(toPlayer);
         Vector2 dir      = (dist > 0.001f) ? Vector2Scale(toPlayer, 1.0f / dist)
@@ -3045,7 +3824,7 @@ static void UpdateEnemies(float dt)
                 /* Commits to a direction, shows it, then charges. It threatens
                    space instead of shooting, so you dodge with movement rather
                    than by out-aiming a projectile. */
-                e->timer -= dt;
+                e->timer -= edt;
                 switch (e->phase)
                 {
                     case 0:     /* close in until it is worth charging */
@@ -3094,7 +3873,7 @@ static void UpdateEnemies(float dt)
                where the pressure is: you get one beat to have already moved. */
             case EN_RUSHER:
             {
-                e->timer -= dt;
+                e->timer -= edt;
                 switch (e->phase)
                 {
                     case 0:     /* close to a range worth charging from */
@@ -3164,7 +3943,7 @@ static void UpdateEnemies(float dt)
                                      Vector2Add(Vector2Scale(dir, want), sway),
                                      1.0f - powf(0.08f, dt));
 
-                e->timer -= dt;
+                e->timer -= edt;
                 if (e->timer <= 0.0f)
                 {
                     float gap = 2.9f - wave * 0.04f;
@@ -3184,7 +3963,7 @@ static void UpdateEnemies(float dt)
             {
                 e->vel = Vector2Scale(e->vel, powf(0.02f, dt));  /* plants itself */
 
-                e->timer -= dt;
+                e->timer -= edt;
                 if (e->timer <= 0.0f)
                 {
                     float gap = 2.6f - wave * 0.05f;
@@ -3234,7 +4013,7 @@ static void UpdateEnemies(float dt)
                 bool infront = bare ||
                                fabsf(AngleDelta(want, e->timer2)) < SHIELD_ARC;
 
-                e->timer -= dt;
+                e->timer -= edt;
                 switch (e->phase)
                 {
                     case 0:     /* advance, slowly, like something heavy */
@@ -3295,7 +4074,7 @@ static void UpdateEnemies(float dt)
                         e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 80.0f),
                                              1.0f - powf(0.2f, dt));
 
-                        e->timer -= dt;
+                        e->timer -= edt;
                         if (e->timer <= 0.0f)
                         {
                             e->timer = 2.4f;
@@ -3315,7 +4094,7 @@ static void UpdateEnemies(float dt)
                         /* Adds are seasoning, not the meal - the barrage is what
                            this fight is about, and a stream of chasers on top of
                            it just buries the pattern you are supposed to read. */
-                        e->timer2 -= dt;
+                        e->timer2 -= edt;
                         if (e->timer2 <= 0.0f)
                         {
                             e->timer2 = 10.0f;
@@ -3341,7 +4120,7 @@ static void UpdateEnemies(float dt)
                         e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, want),
                                              1.0f - powf(0.25f, dt));
 
-                        e->timer -= dt;
+                        e->timer -= edt;
                         if (e->timer <= 0.0f && e->gen == 0)
                         {
                             e->timer = 1.7f;
@@ -3357,7 +4136,7 @@ static void UpdateEnemies(float dt)
 
                         /* Only the original summons - the halves doing it as
                            well would bury the arena the moment it broke apart. */
-                        e->timer2 -= dt;
+                        e->timer2 -= edt;
                         if (e->timer2 <= 0.0f && e->gen == 0)
                         {
                             /* One add per call instead of two, and less often.
@@ -3387,8 +4166,8 @@ static void UpdateEnemies(float dt)
                         e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, 34.0f),
                                              1.0f - powf(0.4f, dt));
 
-                        e->timer  -= dt;
-                        e->timer2 -= dt;
+                        e->timer  -= edt;
+                        e->timer2 -= edt;
 
                         if (e->phase == 0)
                         {
@@ -3501,7 +4280,7 @@ static void UpdateEnemies(float dt)
                         e->vel = Vector2Lerp(e->vel, Vector2Scale(dir, want),
                                              1.0f - powf(0.25f, dt));
 
-                        e->timer -= dt;
+                        e->timer -= edt;
                         if (e->timer <= 0.0f)
                         {
                             /* Guarded it fires a fan out of the shield face -
@@ -3545,7 +4324,7 @@ static void UpdateEnemies(float dt)
                        for a second and a half. */
                     case BK_LANCER:
                     {
-                        e->timer -= dt;
+                        e->timer -= edt;
                         switch (e->phase)
                         {
                             case 0:     /* stalk */
@@ -3638,11 +4417,11 @@ static void UpdateEnemies(float dt)
                                              1.0f - powf(0.2f, dt));
                         if (e->pos.y > GROUND_Y - 260.0f) e->vel.y -= 190.0f * dt;
 
-                        e->timer -= dt;
+                        e->timer -= edt;
 
                         if (e->phase == 0)          /* aimed salvos */
                         {
-                            e->timer2 -= dt;
+                            e->timer2 -= edt;
 
                             if (e->timer <= 0.0f)
                             {
@@ -3695,7 +4474,7 @@ static void UpdateEnemies(float dt)
                        throws its whole mass down the lane you are standing in. */
                     case BK_CHARGER:
                     {
-                        e->timer -= dt;
+                        e->timer -= edt;
                         switch (e->phase)
                         {
                             case 0:     /* stalk */
@@ -3742,7 +4521,12 @@ static void UpdateEnemies(float dt)
             } break;
         }
 
-        e->pos = Vector2Add(e->pos, Vector2Scale(e->vel, dt));
+        /* MUT_SWIFT lives here, on the one line that turns an enemy's
+           velocity into travel. Scaling the displacement rather than every
+           `speed` constant in the behaviour switch means a new enemy kind
+           inherits it for free, and the steering above stays exactly as
+           tuned - they aim the same, they just cover ground faster. */
+        e->pos = Vector2Add(e->pos, Vector2Scale(e->vel, dt * MutEnemySpeed()));
 
         /* keep them inside the arena once they have entered it */
         {
@@ -4025,11 +4809,23 @@ static void ResetGame(void)
     questState   = QS_NONE;
     questFlash   = 0.0f;
     questHold    = 0.0f;
+    questPenalty = 0.0f;
     focusEnemy   = -1;
     focusHits    = 0;
     focusTimer   = 0.0f;
     blastDepth   = 0;
     pendingPicks = 0;
+
+    /* Run-scoped like the build: a rule the last run agreed to must not be
+       waiting for the next one. StartWave(1) below clears mutOn[] from
+       mutArmed[] anyway, but leaving that as the only guard would make a
+       new entry point into this file one line away from a very confusing
+       bug report. */
+    memset(mutOn,    0, sizeof(mutOn));
+    memset(mutArmed, 0, sizeof(mutArmed));
+    mutNextCount = 0;
+    mutCount     = 0;
+    mutBannerT   = 0.0f;
     healSpawnT     = 0.0f;
     weaponSpawnT   = 0.0f;
     dmgSpawnT      = 0.0f;
@@ -4961,7 +5757,7 @@ static void DrawPlayer(void)
     /* Fire-ready ring. With infinite ammo this is the only throttle the player
        has to read, so it lives right on the character. */
     {
-        float interval = tune.fireCooldown * w->cooldownMul * UpFireMul();
+        float interval = tune.fireCooldown * w->cooldownMul * UpFireMul() * MutFireMul();
         float t = (player.cooldown > 0.0f && interval > 0.0f)
                       ? 1.0f - Clamp(player.cooldown / interval, 0.0f, 1.0f)
                       : 1.0f;
@@ -5150,6 +5946,33 @@ static void DrawHud(void)
                                   (Color){ 120, 230, 255, 70 });
     }
 
+    /* Which rules are in force, under the hearts. Right-aligned because the
+       hearts already anchor that corner, and standing rather than flashed: a
+       mutator changes how the whole wave has to be flown, so "why am I falling
+       this fast" must be answerable at any moment, not only at the banner.
+
+       Only while the wave is actually being played: the rules stay live
+       through the intermission (you are still in the air under them), but
+       the HUD shows through the upgrade overlay, and the wave you just left
+       listed beside the offer for the next one reads as one list. */
+    if (mutCount > 0 && state == ST_PLAY)
+    {
+        float y = 56.0f;
+        for (int i = 0; i < MUT_COUNT; i++)
+        {
+            if (!mutOn[i]) continue;
+
+            const MutatorDef *md = &MUTATORS[i];
+            float w = UIWidth(FW_BOLD, md->name, 22.0f);
+
+            DrawRectangle((int)(SCREEN_W - 30.0f - w - 8.0f), (int)y - 2, 4, 24,
+                          Fade(md->color, 0.9f));
+            UIDraw(FW_BOLD, md->name, SCREEN_W - 24.0f - w, y, 22.0f,
+                   Fade(md->color, 0.92f));
+            y += 30.0f;
+        }
+    }
+
     /* current weapon - permanent, so it is simply stated rather than timed */
     {
         const WeaponDef *w = &WEAPONS[player.weapon];
@@ -5160,10 +5983,21 @@ static void DrawHud(void)
         /* Under the weapon because it multiplies whatever is above it. Stated
            as one total: the player has no way to act on the split between what
            the clears gave and what the cards did. */
-        UIDraw(FW_REG, "공격력", 24.0f, SCREEN_H - 62.0f, 20.0f,
-               (Color){ 160, 170, 200, 200 });
+        /* Turns red while a failed challenge is being paid off, and says by
+           how much. The number itself already includes the penalty, so
+           without the tag the player would only see a figure that dropped
+           for no stated reason. */
+        bool  debuff = (questPenalty > 0.0f);
+        Color dmgCol = debuff ? (Color){ 255, 110, 110, 255 }
+                              : (Color){ 255, 190, 130, 255 };
+
+        UIDraw(FW_REG, debuff ? TextFormat("공격력  도전 실패 -%.0f%%",
+                                           questPenalty * 100.0f)
+                              : "공격력",
+               24.0f, SCREEN_H - 62.0f, 20.0f,
+               debuff ? dmgCol : (Color){ 160, 170, 200, 200 });
         UIDraw(FW_BOLD, TextFormat("%.0f%%", PlayerDamageMul() * 100.0f),
-               24.0f, SCREEN_H - 38.0f, 28.0f, (Color){ 255, 190, 130, 255 });
+               24.0f, SCREEN_H - 38.0f, 28.0f, dmgCol);
     }
 
     /* The multiplier already floats over the player's head, popping on every
@@ -5194,7 +6028,34 @@ static void DrawHud(void)
         const char *t = (wave % 5 == 0) ? TextFormat("웨이브 %d  -  보스", wave)
                                         : TextFormat("웨이브 %d", wave);
         UIDrawC(FW_BOLD, t, SCREEN_W / 2.0f, SCREEN_H / 2.0f - 120.0f, 70.0f,
-                Fade(RAYWHITE, a * 0.9f));
+                Fade(mutCount > 0 ? MUTATORS[MutFirst()].color : RAYWHITE, a * 0.9f));
+    }
+
+    /* Named under the wave number for the first couple of seconds. The standing
+       readout in the corner is the reference; this is the announcement, and it
+       has to arrive before the first enemy does. */
+    if (mutBannerT > 0.0f && state == ST_PLAY && mutCount > 0)
+    {
+        float a = (mutBannerT > 2.2f) ? (2.6f - mutBannerT) / 0.4f
+                                      : fminf(1.0f, mutBannerT / 0.7f);
+        /* Built into a local buffer rather than chained TextFormat calls:
+           that helper hands back slots from a ring of four, and the pieces
+           have to stay alive together long enough to be measured. */
+        char   line[128];
+        size_t at = 0;
+        line[0] = 0;
+
+        for (int i = 0, k = 0; i < MUT_COUNT && at < sizeof(line) - 1; i++)
+        {
+            if (!mutOn[i]) continue;
+            at += (size_t)snprintf(line + at, sizeof(line) - at, "%s%s",
+                                   (k++ > 0) ? "  +  " : "", MUTATORS[i].name);
+        }
+
+        UIDrawC(FW_BOLD, line, SCREEN_W / 2.0f, SCREEN_H / 2.0f - 40.0f, 34.0f,
+                Fade(MUTATORS[MutFirst()].color, a));
+        UIDrawC(FW_REG, "변칙 웨이브", SCREEN_W / 2.0f, SCREEN_H / 2.0f + 4.0f, 22.0f,
+                Fade((Color){ 210, 218, 240, 255 }, a * 0.8f));
     }
 }
 
@@ -5231,7 +6092,8 @@ static void DrawTitle(void)
         UIDrawC(FW_BOLD, TextFormat("최고 기록  %ld", bestScore), SCREEN_W / 2.0f, 580.0f,
                 24.0f, (Color){ 255, 225, 120, 255 });
 
-    UIDrawC(FW_REG, "T  게임 방법      F11  창 모드      ESC  종료",
+    UIDrawC(FW_REG, TextFormat("T  게임 방법     M  음악 %s     F11  창 모드     ESC  종료",
+                               musEnabled ? "켜짐" : "꺼짐"),
             SCREEN_W / 2.0f, SCREEN_H - 52.0f, 20.0f, (Color){ 120, 132, 160, 255 });
 }
 
@@ -5288,7 +6150,7 @@ static void DrawTutorial(void)
         const char      *names[3] = { "체력 상자", "무기 상자", "공격력 상자" };
         const char      *desc[3]  = {
             "체력을 1 회복합니다",
-            "무기가 바뀍니다  -  죽을 때까지 유지됩니다",
+            "무기가 바뀝니다  -  죽을 때까지 유지됩니다",
             "공격력이 영구히 오릅니다"
         };
         Color colors[3] = { (Color){ 110, 255, 170, 255 },
@@ -5338,6 +6200,19 @@ static Rectangle RerollButtonRect(void)
 {
     const float w = 300.0f, h = 52.0f;
     return (Rectangle){ SCREEN_W / 2.0f - w / 2.0f, SCREEN_H - 122.0f, w, h };
+}
+
+/* The forecast of what the next wave is bringing. Lives in the band between
+   the cards and the reroll button - the one place on this screen with
+   nothing in it. Nothing here is interactive: the rules are not a choice,
+   and the only decision this screen still asks for is which card. What it
+   buys is that the pick can be made KNOWING what is coming - taking 활력
+   over 고화력 because the next wave says 적 흉포화 is the whole point of
+   showing it before the wave rather than at the start of it. */
+static Rectangle MutBannerRect(void)
+{
+    const float w = 900.0f, h = 64.0f;
+    return (Rectangle){ SCREEN_W / 2.0f - w / 2.0f, 518.0f, w, h };
 }
 
 /* Card geometry, shared by the drawing and the hit-testing so they cannot drift. */
@@ -5511,6 +6386,58 @@ static void DrawUpgradeScreen(void)
                           : (owned ? TextFormat("보유 %d", owned) : "새 강화"),
                 r.x + r.width / 2.0f, r.y + 200.0f, 20.0f,
                 Fade((Color){ 140, 150, 175, 255 }, a));
+    }
+
+    /* ---- what the next wave is bringing ---- */
+    if (mutNextCount > 0)
+    {
+        Rectangle r = MutBannerRect();
+        r.y += rise;
+
+        Color key  = MUTATORS[mutNext[0]].color;
+        /* A slow pulse rather than a static panel. This is a warning, and it
+           has to pull the eye once on the way past the cards without competing
+           with them for the whole time the screen is up. */
+        float glow = 0.78f + 0.22f * sinf((float)GetTime() * 3.2f);
+
+        DrawRectangleRec(r, Fade(key, 0.13f * a));
+        DrawRectangleLinesEx(r, 2.0f, Fade(key, 0.75f * glow * a));
+
+        /* ---- left column: the label and what clearing it pays ---- */
+        {
+            const float lx = r.x + 18.0f;
+
+            UIDraw(FW_BOLD, "다음 웨이브", lx, r.y + 10.0f, 22.0f,
+                   Fade(key, glow * a));
+            UIDraw(FW_REG,
+                   TextFormat("돌파 시  공격력 +%.0f%%   새로고침 +1",
+                              DMG_PER_STACK * DMG_MUTATOR * mutNextCount * 100.0f),
+                   lx, r.y + 38.0f, 20.0f,
+                   Fade((Color){ 255, 190, 130, 255 }, 0.9f * a));
+        }
+
+        DrawRectangle((int)(r.x + 284.0f), (int)(r.y + 12.0f), 1, 40,
+                      Fade((Color){ 110, 120, 150, 255 }, 0.7f * a));
+
+        /* ---- right: one tile per rule, split evenly ---- */
+        {
+            const float tx = r.x + 296.0f;
+            const float tw = (r.x + r.width - 14.0f - tx) / (float)mutNextCount;
+
+            for (int i = 0; i < mutNextCount; i++)
+            {
+                const MutatorDef *md = &MUTATORS[mutNext[i]];
+                float cx = tx + tw * ((float)i + 0.5f);
+
+                if (i > 0)
+                    DrawRectangle((int)(tx + tw * (float)i - 6.0f), (int)(r.y + 16.0f),
+                                  1, 34, Fade((Color){ 110, 120, 150, 255 }, 0.5f * a));
+
+                UIDrawC(FW_BOLD, md->name, cx, r.y + 6.0f, 24.0f, Fade(md->color, a));
+                UIDrawC(FW_REG, md->desc, cx, r.y + 38.0f, 20.0f,
+                        Fade((Color){ 205, 214, 235, 255 }, 0.85f * a));
+            }
+        }
     }
 
     if (live)
@@ -5742,6 +6669,11 @@ typedef struct ShotOpts {
                             /* muzzle, the recoil trail all need it             */
     Vector2     aim;        /* where the reticle sits, in virtual units         */
     int         aug[UP_COUNT];
+    bool        mut[MUT_COUNT];  /* pins the forecast (upgrade) or the rules (play) */
+    int         mutCount;
+    int         cards[3];   /* pins the three offered upgrades, -1 = leave the roll */
+    int         cardCount;
+    MusicTrack  music;      /* --music: write the song to a wav and exit */
 } ShotOpts;
 
 static ShotOpts shot;
@@ -5756,6 +6688,10 @@ static const char *const SHOT_WEAPON_KEYS[] = {
     "pistol", "smg", "sword", "shotgun", "railgun", "grenade", "bazooka",
     "flamer", "ricochet", "harpoon", "laser"
 };
+static const char *const SHOT_MUT_KEYS[] = {
+    "swift", "barrage", "ward", "savage",
+    "gravity", "recoil", "slowbullet", "heavyshot", "scorch", "halved"
+};
 static const char *const SHOT_AUG_KEYS[] = {
     "vitality", "rapid", "caliber", "recoil", "bigshot", "velocity",
     "asbestos", "deathblast", "lifesteal", "thorns", "greed",
@@ -5767,6 +6703,8 @@ typedef char shot_weapon_keys_match[
     (sizeof(SHOT_WEAPON_KEYS) / sizeof(SHOT_WEAPON_KEYS[0]) == WP_COUNT) ? 1 : -1];
 typedef char shot_aug_keys_match[
     (sizeof(SHOT_AUG_KEYS) / sizeof(SHOT_AUG_KEYS[0]) == UP_COUNT) ? 1 : -1];
+typedef char shot_mut_keys_match[
+    (sizeof(SHOT_MUT_KEYS) / sizeof(SHOT_MUT_KEYS[0]) == MUT_COUNT) ? 1 : -1];
 
 static void ShotUsage(void)
 {
@@ -5784,10 +6722,15 @@ static void ShotUsage(void)
     "  --seed=N       rng seed              (default 1)\n"
     "  --weapon=KEY   see --list\n"
     "  --aug=K,K,...  grant one stack each; repeat a key to stack it\n"
+    "  --cards=K,K,K  pin the three offered upgrades (upgrade only)\n"
+    "  --mut=K,K      wave mutators - the forecast on --shot=upgrade,\n"
+    "                 the rules in force on --shot=play\n"
     "  --quest=STATE  active | fail | done  (play only)\n"
     "  --qkind=KIND   airkill | nohit | speedkill | longshot  (pins the roll)\n"
     "  --fire         hold the trigger down for the whole capture\n"
     "  --aim=X,Y      reticle position in 1280x720 units (default 640,300)\n"
+    "  --music=TRACK  title | battle - render the song to a wav and exit\n"
+    "                 --at sets the length, --out the file\n"
     "  --list         print the weapon and augment keys, then exit\n"
     "\n"
     "Frames run at a fixed 1/60s, so a given command always renders the same\n"
@@ -5799,6 +6742,9 @@ static void ShotList(void)
 {
     printf("weapons:\n ");
     for (int i = 0; i < WP_COUNT; i++) printf(" %s", SHOT_WEAPON_KEYS[i]);
+
+    printf("\n\nmutators:\n ");
+    for (int i = 0; i < MUT_COUNT; i++) printf(" %s", SHOT_MUT_KEYS[i]);
 
     printf("\n\naugments:\n ");
     for (int i = 0; i < UP_COUNT; i++)
@@ -5833,6 +6779,7 @@ static bool ShotParse(int argc, char **argv)
     shot.at     = 1.0f;
     shot.seed   = 1;
     shot.quest     = SQ_DEFAULT;
+    for (int i = 0; i < 3; i++) shot.cards[i] = -1;
     shot.questKind = -1;
     shot.weapon    = -1;
     shot.aim    = (Vector2){ SCREEN_W / 2.0f, 300.0f };
@@ -5857,6 +6804,13 @@ static bool ShotParse(int argc, char **argv)
             continue;
         }
 
+        if ((v = ShotArg(a, "--music=")) != NULL)
+        {
+            if      (strcmp(v, "title")  == 0) shot.music = MUS_TITLE;
+            else if (strcmp(v, "battle") == 0) shot.music = MUS_BATTLE;
+            else { printf("unknown track: %s\n", v); return false; }
+            continue;
+        }
         if ((v = ShotArg(a, "--out="))   != NULL) { shot.out   = v;               continue; }
         if ((v = ShotArg(a, "--scale=")) != NULL) { shot.scale = atoi(v);         continue; }
         if ((v = ShotArg(a, "--wave="))  != NULL) { shot.wave  = atoi(v);         continue; }
@@ -5896,6 +6850,47 @@ static bool ShotParse(int argc, char **argv)
             int w = ShotLookup(SHOT_WEAPON_KEYS, WP_COUNT, v, strlen(v));
             if (w < 0) { printf("unknown weapon: %s  (try --list)\n", v); return false; }
             shot.weapon = w;
+            continue;
+        }
+
+        /* The card roll is weighted, so a rarely-offered upgrade can take a
+           dozen seeds to turn up - which makes checking that its value line
+           fits the card a matter of luck rather than a check. */
+        if ((v = ShotArg(a, "--cards=")) != NULL)
+        {
+            while (*v != 0 && shot.cardCount < 3)
+            {
+                const char *comma = strchr(v, ',');
+                size_t      len   = comma ? (size_t)(comma - v) : strlen(v);
+                int         id    = ShotLookup(SHOT_AUG_KEYS, UP_COUNT, v, len);
+
+                if (id < 0)
+                {
+                    printf("unknown upgrade: %.*s  (try --list)\n", (int)len, v);
+                    return false;
+                }
+                shot.cards[shot.cardCount++] = id;
+                v = comma ? comma + 1 : v + len;
+            }
+            continue;
+        }
+
+        if ((v = ShotArg(a, "--mut=")) != NULL)
+        {
+            while (*v != 0)
+            {
+                const char *comma = strchr(v, ',');
+                size_t      len   = comma ? (size_t)(comma - v) : strlen(v);
+                int         id    = ShotLookup(SHOT_MUT_KEYS, MUT_COUNT, v, len);
+
+                if (id < 0)
+                {
+                    printf("unknown mutator: %.*s  (try --list)\n", (int)len, v);
+                    return false;
+                }
+                if (!shot.mut[id]) { shot.mut[id] = true; shot.mutCount++; }
+                v = comma ? comma + 1 : v + len;
+            }
             continue;
         }
 
@@ -5951,13 +6946,26 @@ static void ShotSetup(void)
 
     switch (shot.scene)
     {
-        case SHOT_TITLE: state = ST_TITLE;    return;
-        case SHOT_HELP:  state = ST_TUTORIAL; return;
+        case SHOT_TITLE:    state = ST_TITLE;    return;
+        case SHOT_HELP:     state = ST_TUTORIAL; return;
 
         case SHOT_UPGRADE:
             /* The screen a wave clear leads to, minus the wave. */
             StartWave(shot.wave);
             RollUpgrades();
+            for (int i = 0; i < shot.cardCount; i++) upChoices[i] = shot.cards[i];
+            RollMutators();
+
+            /* --mut pins the forecast, so the banner can be checked against
+               a chosen pair (widest names, longest descriptions) instead of
+               whatever the seed happened to draw. */
+            if (shot.mutCount > 0)
+            {
+                mutNextCount = 0;
+                for (int i = 0; i < MUT_COUNT && mutNextCount < MUT_MAX_ACTIVE; i++)
+                    if (shot.mut[i]) mutNext[mutNextCount++] = i;
+            }
+
             pendingPicks = (shot.wave % 5 == 0) ? 2 : 1;
             upgradeT     = 0.0f;
             state        = ST_UPGRADE;
@@ -5972,6 +6980,10 @@ static void ShotSetup(void)
         default:
             break;
     }
+
+    /* Armed before StartWave, which is the one place that promotes them -
+       exactly the path a real run takes out of the upgrade screen. */
+    for (int i = 0; i < MUT_COUNT; i++) mutArmed[i] = shot.mut[i];
 
     StartWave(shot.wave);
     state = ST_PLAY;
@@ -6000,6 +7012,7 @@ static void ShotSetup(void)
 static const char *ShotOutPath(void)
 {
     if (shot.out != NULL) return shot.out;
+    if (shot.music != MUS_OFF) return "shot-music.wav";
 
     switch (shot.scene)
     {
@@ -6009,6 +7022,35 @@ static const char *ShotOutPath(void)
         case SHOT_GAMEOVER: return "shot-gameover.png";
         default:            return "shot-play.png";
     }
+}
+
+/* Renders the song straight through MusRender - the same function the audio
+   thread calls - so what lands in the wav is what the game plays, and not a
+   second implementation of it that can drift. No audio device is opened:
+   this runs before the window exists. */
+static int ShotWriteMusic(void)
+{
+    int    frames = (int)(MUS_RATE * (shot.at > 0.0f ? shot.at : 1.0f));
+    short *data   = (short *)MemAlloc(frames * sizeof(short));
+
+    musTrack    = shot.music;
+    musWant     = shot.music;
+    musGain     = 1.0f;          /* no fade-in - the file starts on beat 1 */
+    musDrum.rng = 0x9E3779B9u;
+
+    for (int i = 0; i < frames; i += MUS_CHUNK)
+    {
+        int n = (frames - i < MUS_CHUNK) ? (frames - i) : MUS_CHUNK;
+        MusRender(data + i, n);
+    }
+
+    Wave w  = { (unsigned int)frames, MUS_RATE, 16, 1, data };
+    bool ok = ExportWave(w, ShotOutPath());
+    MemFree(data);
+
+    printf(ok ? "wrote %s (%.1fs)\n" : "could not write %s (%.1fs)\n",
+           ShotOutPath(), (double)frames / MUS_RATE);
+    return ok ? 0 : 1;
 }
 
 #endif  /* SHOTCOIL_CAPTURE */
@@ -6025,6 +7067,7 @@ int main(void)
     /* Parsed before anything is created: --list and a bad flag have to be able
        to answer without opening a window, and --scale decides how big it is. */
     if (!ShotParse(argc, argv)) return 0;
+    if (shot.music != MUS_OFF) return ShotWriteMusic();
 
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(SCREEN_W * shot.scale, SCREEN_H * shot.scale, "SHOTCOIL");
@@ -6066,6 +7109,7 @@ int main(void)
 
     LoadUIFonts();
     InitSfx();
+    InitMusic();
 
     tune = TUNE_DEFAULT;
     bestScore = LoadBest();
@@ -6091,13 +7135,12 @@ int main(void)
 
         bool toggledView = IsKeyPressed(KEY_F11) ||
                            (IsKeyDown(KEY_LEFT_ALT) && IsKeyPressed(KEY_ENTER));
-        if (toggledView)
-        {
-            ToggleBorderlessWindowed();
-            fullscreen = !fullscreen;
-            UpdateViewport();
-            ApplyCursorMode();
-        }
+        if (toggledView) ToggleFullscreenMode();
+
+        /* Music is deliberately not a per-screen key: a player who wants it
+           off wants it off, and there is no settings page to bury it in. */
+        if (IsKeyPressed(KEY_M)) musEnabled = !musEnabled;
+        UpdateMusic();
 
         UpdateAimCursor();
 
@@ -6135,6 +7178,7 @@ int main(void)
             case ST_PLAY:
                 runTime += dt;
                 if (waveBannerT > 0.0f) waveBannerT -= rawDt;
+                if (mutBannerT  > 0.0f) mutBannerT  -= rawDt;
 
                 UpdateQuest(dt);
                 UpdatePlayer(dt);
@@ -6244,6 +7288,7 @@ int main(void)
     }
 
 quit:
+    ShutdownMusic();
     ShutdownSfx();
     UnloadUIFonts();
     CloseWindow();
